@@ -481,6 +481,30 @@ public:
         this->publish_state();
     }
 
+    void loop() override {
+        while (UARTDevice::available() > 0) {
+            if (!UARTDevice::read_byte(&recv_buf_[recv_buf_len_])) {
+                break;
+            }
+            last_recv_millis_ = millis();
+            recv_buf_len_++;
+            if (recv_buf_len_ == MsgLen) {
+                process_message(recv_buf_);
+                recv_buf_len_ = 0;
+            }
+        }
+
+        if (recv_buf_len_ > 0) {
+            // A byte takes about 96 milliseconds to transmit.
+            if (millis() - last_recv_millis_ > 150) {
+                ESP_LOGE(TAG, "discarding incomplete data %s",
+                         format_hex_pretty(recv_buf_, recv_buf_len_).c_str());
+                recv_buf_len_ = 0;
+            }
+            return;
+        }
+    }
+
     climate::ClimateTraits traits() override {
         return supported_traits_;
     }
@@ -876,7 +900,7 @@ private:
         last_sent_recv_type_b_millis_ = millis();
     }
 
-    void process_message(const uint8_t* buffer, bool* had_error) {
+    void process_message(const uint8_t* buffer) {
         ESP_LOGD(TAG, "received %s", format_hex_pretty(buffer, MsgLen).c_str());
 
         if (calc_checksum(buffer) != buffer[12]) {
@@ -888,7 +912,6 @@ private:
                 return;
             }
             ESP_LOGE(TAG, "invalid checksum %s", format_hex_pretty(buffer, MsgLen).c_str());
-            *had_error = true;
             return;
         }
 
@@ -924,7 +947,7 @@ private:
 
         switch (buffer[0] & 0b111) {
             case 0: // 0xC8/A8/28
-                process_status_message(*sender, buffer, had_error);
+                process_status_message(*sender, buffer);
                 break;
             case 1: // 0xC9
                 process_capabilities_message(*sender, buffer);
@@ -940,14 +963,7 @@ private:
         }
     }
 
-    void process_status_message(MessageSender sender, const uint8_t* buffer, bool* had_error) {
-        // If we just had a failure, ignore this messsage because it might be invalid too.
-        if (*had_error) {
-            ESP_LOGE(TAG, "ignoring due to previous error %s",
-                     format_hex_pretty(buffer, MsgLen).c_str());
-            return;
-        }
-
+    void process_status_message(MessageSender sender, const uint8_t* buffer) {
         // Consider slave controller initialized if we received a status message from the other
         // controller or the unit.
         if (slave_) {
@@ -1043,7 +1059,6 @@ private:
                     break;
                 default:
                     ESP_LOGE(TAG, "received invalid operation mode from AC (%u)", mode_val);
-                    *had_error = true;
                     return;
             }
         }
@@ -1067,7 +1082,6 @@ private:
                 break;
             default:
                 ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
-                *had_error = true;
                 return;
         }
 
@@ -1276,19 +1290,6 @@ private:
     void update() {
         ESP_LOGD(TAG, "update");
 
-        bool had_error = false;
-        while (UARTDevice::available() > 0) {
-            if (!UARTDevice::read_byte(&recv_buf_[recv_buf_len_])) {
-                break;
-            }
-            last_recv_millis_ = millis();
-            recv_buf_len_++;
-            if (recv_buf_len_ == MsgLen) {
-                process_message(recv_buf_, &had_error);
-                recv_buf_len_ = 0;
-            }
-        }
-
         // If we did not receive the message we sent last time, try to send it again next time.
         // Ignore this when we're initializing because the unit then immediately responds by
         // sending a lot of messages and this introduces a delay.
@@ -1309,19 +1310,6 @@ private:
                     break;
             }
             pending_send_ = PendingSendKind::None;
-            return;
-        }
-
-        if (recv_buf_len_ > 0) {
-            if (millis() - last_recv_millis_ > 15 * 1000) {
-                ESP_LOGE(TAG, "discarding incomplete data %s",
-                         format_hex_pretty(recv_buf_, recv_buf_len_).c_str());
-                recv_buf_len_ = 0;
-            }
-            return;
-        }
-
-        if (had_error) {
             return;
         }
 
