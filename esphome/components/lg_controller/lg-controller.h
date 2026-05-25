@@ -179,6 +179,8 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     uint8_t send_buf_[MsgLen] = {};
     uint32_t last_sent_status_millis_ = 0;
     uint32_t last_sent_recv_type_b_millis_ = 0;
+    uint32_t last_write_millis_ = 0;
+    uint32_t last_line_busy_millis_ = 0;
 
     enum class PendingSendKind : uint8_t { None, Status, TypeA, TypeB };
     PendingSendKind pending_send_ = PendingSendKind::None;
@@ -186,6 +188,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     bool pending_status_change_ = false;
     bool pending_type_a_settings_change_ = false;
     bool pending_type_b_settings_change_ = false;
+    bool pending_type_b_timed_message_ = false;
 
     bool is_initializing_ = true;
 
@@ -482,11 +485,27 @@ public:
     }
 
     void loop() override {
+        uint32_t millis_now = millis();
+
+        // Track if the RX pin is idle for at least 500 ms to avoid collisions on the bus as much
+        // as possible. If there is still a collision, we'll likely both start sending at
+        // approximately the same time and the message will hopefully be corrupt (and ignored)
+        // anyway. Else the pending_send_/send_buf_ mechanism should catch it and we try again.
+        //
+        // Note: using digital_read is *much* better for this than using UARTDevice because that
+        // interface has significant delays. It has to wait for a full byte to arrive and this
+        // takes about 9-10 ms with our slow baud rate. There are also various buffers and
+        // timeouts before incoming bytes reach us.
+        if (UARTDevice::available() > 0 || !rx_pin_.digital_read()) {
+            this->last_line_busy_millis_ = millis_now;
+        }
+
+        bool bytes_received = false;
         while (UARTDevice::available() > 0) {
             if (!UARTDevice::read_byte(&recv_buf_[recv_buf_len_])) {
                 break;
             }
-            last_recv_millis_ = millis();
+            bytes_received = true;
             recv_buf_len_++;
             if (recv_buf_len_ == MsgLen) {
                 process_message(recv_buf_);
@@ -494,14 +513,65 @@ public:
             }
         }
 
+        if (bytes_received) {
+            last_recv_millis_ = millis_now;
+        }
+
         if (recv_buf_len_ > 0) {
             // A byte takes about 96 milliseconds to transmit.
-            if (millis() - last_recv_millis_ > 150) {
+            if (millis_now - last_recv_millis_ > 150) {
                 ESP_LOGE(TAG, "discarding incomplete data %s",
                          format_hex_pretty(recv_buf_, recv_buf_len_).c_str());
                 recv_buf_len_ = 0;
             }
             return;
+        }
+
+        // If we did not receive the message we sent last time, try to send it again.
+        // Ignore this when we're initializing because the unit then immediately responds by
+        // sending a lot of messages and this introduces a delay.
+        if (pending_send_ != PendingSendKind::None &&
+            (millis_now - last_write_millis_ > 2000)) {
+            ESP_LOGE(TAG, "did not receive message we just sent");
+            switch (pending_send_) {
+                case PendingSendKind::Status:
+                    pending_status_change_ = true;
+                    break;
+                case PendingSendKind::TypeA:
+                    pending_type_a_settings_change_ = true;
+                    break;
+                case PendingSendKind::TypeB:
+                    pending_type_b_settings_change_ = true;
+                    break;
+                case PendingSendKind::None:
+                    ESP_LOGE(TAG, "unreachable");
+                    break;
+            }
+            pending_send_ = PendingSendKind::None;
+            return;
+        }
+
+        // Send if there's a pending message.
+        if (pending_send_ == PendingSendKind::None &&
+            (millis_now - last_line_busy_millis_ > 500) &&
+            !(slave_ && is_initializing_)) {
+
+            if (pending_type_a_settings_change_) {
+                send_type_a_settings_message();
+            } else if (pending_type_b_settings_change_) {
+                send_type_b_settings_message(/* timed = */ false);
+            } else if (pending_type_b_timed_message_) {
+                send_type_b_settings_message(/* timed = */ true);
+                pending_type_b_timed_message_ = false;
+            } else if (pending_status_change_) {
+                // Send a status message if there is a pending change.
+                // Additionally, queue a Type A message after sending the status message because some
+                // units set the vane position to the default setting after changing swing mode or
+                // operation mode.
+                send_status_message();
+                pending_type_a_settings_change_ = true;
+            }
+
         }
     }
 
@@ -806,10 +876,11 @@ private:
 
         ESP_LOGD(TAG, "sending %s", format_hex_pretty(send_buf_, MsgLen).c_str());
         UARTDevice::write_array(send_buf_, MsgLen);
+        last_write_millis_ = millis();
 
         pending_status_change_ = false;
         pending_send_ = PendingSendKind::Status;
-        last_sent_status_millis_ = millis();
+        last_sent_status_millis_ = last_write_millis_;
 
         // If we sent an updated temperature to the AC, update temperature in HA too.
         // Slave controller temperature sensor is ignored.
@@ -859,6 +930,7 @@ private:
 
         ESP_LOGD(TAG, "sending %s", format_hex_pretty(send_buf_, MsgLen).c_str());
         UARTDevice::write_array(send_buf_, MsgLen);
+        last_write_millis_ = millis();
 
         pending_type_a_settings_change_ = false;
         pending_send_ = PendingSendKind::TypeA;
@@ -894,10 +966,11 @@ private:
 
         ESP_LOGD(TAG, "sending %s", format_hex_pretty(send_buf_, MsgLen).c_str());
         UARTDevice::write_array(send_buf_, MsgLen);
+        last_write_millis_ = millis();
 
         pending_type_b_settings_change_ = false;
         pending_send_ = PendingSendKind::TypeB;
-        last_sent_recv_type_b_millis_ = millis();
+        last_sent_recv_type_b_millis_ = last_write_millis_;
     }
 
     void process_message(const uint8_t* buffer) {
@@ -1288,31 +1361,6 @@ private:
     }
 
     void update() {
-        ESP_LOGD(TAG, "update");
-
-        // If we did not receive the message we sent last time, try to send it again next time.
-        // Ignore this when we're initializing because the unit then immediately responds by
-        // sending a lot of messages and this introduces a delay.
-        if (pending_send_ != PendingSendKind::None && !is_initializing_) {
-            ESP_LOGE(TAG, "did not receive message we just sent");
-            switch (pending_send_) {
-                case PendingSendKind::Status:
-                    pending_status_change_ = true;
-                    break;
-                case PendingSendKind::TypeA:
-                    pending_type_a_settings_change_ = true;
-                    break;
-                case PendingSendKind::TypeB:
-                    pending_type_b_settings_change_ = true;
-                    break;
-                case PendingSendKind::None:
-                    ESP_LOGE(TAG, "unreachable");
-                    break;
-            }
-            pending_send_ = PendingSendKind::None;
-            return;
-        }
-
         uint32_t millis_now = millis();
 
         // Handle sleep timer.
@@ -1339,72 +1387,17 @@ private:
 
         if (slave_ && is_initializing_) {
             ESP_LOGD(TAG, "Not sending, waiting for other controller or unit to send first");
-            return;
         }
 
-        // Make sure the RX pin is idle for at least 500 ms to avoid collisions on the bus as much
-        // as possible. If there is still a collision, we'll likely both start sending at
-        // approximately the same time and the message will hopefully be corrupt (and ignored)
-        // anyway. Else the pending_send_/send_buf_ mechanism should catch it and we try again.
-        //
-        // Note: using digital_read is *much* better for this than using UARTDevice because that
-        // interface has significant delays. It has to wait for a full byte to arrive and this
-        // takes about 9-10 ms with our slow baud rate. There are also various buffers and
-        // timeouts before incoming bytes reach us.
-        //
-        // 500 ms might be overkill, but the device usually sends the same message twice with a
-        // short delay (about 200 ms?) between them so let's not send there either to avoid
-        // collisions.
-        auto check_can_send = [&]() -> bool {
-            while (true) {
-                if (UARTDevice::available() > 0 || !rx_pin_.digital_read()) {
-                    ESP_LOGD(TAG, "line busy, not sending yet");
-                    return false;
-                }
-                if (millis() - millis_now > 500) {
-                    return true;
-                }
-                delay(5);
-            }
-        };
-
-        if (pending_type_a_settings_change_) {
-            if (check_can_send()) {
-                send_type_a_settings_message();
-            }
-            return;
-        }
-        if (pending_type_b_settings_change_) {
-            if (check_can_send()) {
-                send_type_b_settings_message(/* timed = */ false);
-            }
-            return;
-        }
-        // Send a status message if there is a pending change.
-        // Additionally, queue a Type A message after sending the status message because some
-        // units set the vane position to the default setting after changing swing mode or
-        // operation mode.
-        if (pending_status_change_) {
-            if (check_can_send()) {
-                send_status_message();
-                pending_type_a_settings_change_ = true;
-            }
-            return;
-        }
         // Send an AB message every 10 minutes to request pipe temperature values.
         if (!slave_ && millis_now - last_sent_recv_type_b_millis_ > 10 * 60 * 1000) {
-            if (check_can_send()) {
-                send_type_b_settings_message(/* timed = */ true);
-            }
-            return;
+            pending_type_b_timed_message_ = true;
         }
+
         // Send a status message every 20 seconds.
         // Slave controllers only send a status message when settings are changed.
         if (!slave_ && millis_now - last_sent_status_millis_ > 20 * 1000) {
-            if (check_can_send()) {
-                send_status_message();
-            }
-            return;
+            pending_status_change_ = true;
         }
     }
 };
