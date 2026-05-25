@@ -192,6 +192,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     bool operation_mode_changed_ = false;
 
     bool is_initializing_ = true;
+    bool waiting_for_first_status = true;
 
     uint8_t vane_position_[4] = {0,0,0,0};
     uint8_t fan_speed_[4] = {0,0,0,0};
@@ -432,6 +433,18 @@ public:
         return esphome::setup_priority::BUS;
     }
 
+    // Return the value after a roundtrip through the LG system so we
+    // store the value we expect to hear back.
+    float get_roundtrip_target_temperature(float target) {
+        if (fahrenheit_) {
+            target = TempConversion::lgcelsius_to_celsius
+                (TempConversion::celsius_to_lgcelsius(target));
+        } else {
+            target = round(target * 2) / 2;
+        }
+        return target;
+    }
+
     void setup() override {
         // Load our custom NVS storage to get the capabilities message
         ESPPreferenceObject pref = global_preferences->make_preference<NVSStorage>(this->get_object_id_hash() ^ NVS_STORAGE_VERSION);
@@ -440,6 +453,8 @@ public:
         auto restore = this->restore_state_();
         if (restore.has_value()) {
             restore->apply(this);
+            this->target_temperature = get_roundtrip_target_temperature
+                (this->target_temperature);
         } else {
             this->mode = climate::CLIMATE_MODE_OFF;
             this->target_temperature = 20;
@@ -474,7 +489,8 @@ public:
             operation_mode_changed_ = true;
         }
         if (call.get_target_temperature().has_value()) {
-            this->target_temperature = *call.get_target_temperature();
+            this->target_temperature = get_roundtrip_target_temperature
+                (*call.get_target_temperature());
         }
         if (call.get_fan_mode().has_value()) {
             this->fan_mode = *call.get_fan_mode();
@@ -1042,14 +1058,185 @@ private:
     }
 
     void process_status_message(MessageSender sender, const uint8_t* buffer) {
-        // Consider slave controller initialized if we received a status message from the other
-        // controller or the unit.
+        // To protect against corrupted messages, only allow settings
+        // changes if this is the first status message received from
+        // the LG unit, or if the settings changed bit is set.  If
+        // settings are unexpectedly changed, ignore the entire
+        // message.
+        bool settings_changed = (buffer[1] & 0x01) != 0;
+        bool changes_allowed = waiting_for_first_status || settings_changed;
+
+        // Whether the entire message should be ignored because it is
+        // invalid.
+        bool ignore_message = false;
+
+        uint8_t b = buffer[1];
+        climate::ClimateMode new_mode;
+        if ((b & 0x2) == 0) {
+            new_mode = climate::CLIMATE_MODE_OFF;
+        } else {
+            uint8_t mode_val = (b >> 2) & 0b111;
+            switch (mode_val) {
+                case 0:
+                    new_mode = climate::CLIMATE_MODE_COOL;
+                    break;
+                case 1:
+                    new_mode = climate::CLIMATE_MODE_DRY;
+                    break;
+                case 2:
+                    new_mode = climate::CLIMATE_MODE_FAN_ONLY;
+                    break;
+                case 3:
+                    new_mode = climate::CLIMATE_MODE_HEAT_COOL;
+                    break;
+                case 4:
+                    new_mode = climate::CLIMATE_MODE_HEAT;
+                    break;
+                default:
+                    ESP_LOGE(TAG, "received invalid operation mode from AC (%u)", mode_val);
+                    ignore_message = true;
+            }
+        }
+
+        uint8_t fan_val = b >> 5;
+        climate::ClimateFanMode new_fan_mode;
+        switch (fan_val) {
+            case 0:
+                new_fan_mode = climate::CLIMATE_FAN_LOW;
+                break;
+            case 1:
+                new_fan_mode = climate::CLIMATE_FAN_MEDIUM;
+                break;
+            case 2:
+                new_fan_mode = climate::CLIMATE_FAN_HIGH;
+                break;
+            case 3:
+                new_fan_mode = climate::CLIMATE_FAN_AUTO;
+                break;
+            case 4:
+                new_fan_mode = climate::CLIMATE_FAN_QUIET;
+                break;
+            default:
+                ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
+                ignore_message = true;
+        }
+
+        bool horiz_swing = buffer[2] & 0x40;
+        bool vert_swing = buffer[2] & 0x80;
+        climate::ClimateSwingMode new_swing_mode;
+        if (horiz_swing && vert_swing) {
+            new_swing_mode = climate::CLIMATE_SWING_BOTH;
+        } else if (horiz_swing) {
+            new_swing_mode = climate::CLIMATE_SWING_HORIZONTAL;
+        } else if (vert_swing) {
+            new_swing_mode = climate::CLIMATE_SWING_VERTICAL;
+        } else {
+            new_swing_mode = climate::CLIMATE_SWING_OFF;
+        }
+
+        float target = float((buffer[6] & 0xf) + 15);
+        if (buffer[5] & 0x1) {
+            target += 0.5;
+        }
+        if (fahrenheit_) {
+            target = TempConversion::lgcelsius_to_celsius(target);
+        }
+
+        bool new_purifier = buffer[2] & 0x4;
+        bool new_active_reservation = buffer[3] & 0x10;
+
+        // Make all the changes if changes are allowed.
+        bool mode_changed = this->mode != new_mode;
+        bool fan_mode_changed = this->fan_mode != new_fan_mode;
+        bool swing_mode_changed = this->swing_mode != new_swing_mode;
+        bool set_temperature_changed =
+            this->target_temperature < target - .001 ||
+            this->target_temperature > target + .001;
+        bool purifier_changed = purifier_.state != new_purifier;
+        bool reservation_changed = active_reservation_ != new_active_reservation;
+
+        if (changes_allowed) {
+            if (mode_changed || fan_mode_changed || swing_mode_changed ||
+                set_temperature_changed || purifier_changed ||
+                reservation_changed) {
+                // Don't update our settings if we have a pending
+                // change/send, because else we overwrite changes we
+                // still have to send (or are sending) to the AC.
+                if (pending_status_change_) {
+                    ESP_LOGD(TAG, "ignoring incoming settings changes because "
+                             "of an outgoing pending change");
+                } else if (pending_send_ == PendingSendKind::Status) {
+                    ESP_LOGD(TAG, "ignoring incoming settings changes because "
+                             "of an outgoing pending send");
+                } else {
+                    this->mode = new_mode;
+                    this->fan_mode = new_fan_mode;
+                    if (swing_mode_changed) {
+                        // Avoid calling set_swing_mode unless the swing mode
+                        // has actually changed, since it sends a 0xAA
+                        // message.
+                        set_swing_mode(new_swing_mode);
+                    }
+                    this->target_temperature = target;
+                    purifier_.publish_state(buffer[2] & 0x4);
+                    active_reservation_ = buffer[3] & 0x10;
+                }
+            }
+        } else {
+            std::vector<std::string> changes;
+            if (mode_changed) {
+                changes.push_back("mode");
+            }
+            if (fan_mode_changed) {
+                changes.push_back("fan mode");
+            }
+            if (swing_mode_changed) {
+                changes.push_back("swing mode");
+            }
+            if (set_temperature_changed) {
+                changes.push_back("set temperature");
+            }
+            if (purifier_changed) {
+                changes.push_back("purifier");
+            }
+            if (reservation_changed) {
+                changes.push_back("timer reservation");
+            }
+
+            if (changes.size() > 0) {
+                if (pending_status_change_ ||
+                    pending_send_ == PendingSendKind::Status) {
+                    ESP_LOGD(TAG, "ignoring settings in status message "
+                             "due to pending send");
+                } else {
+                    std::string change_str;
+                    bool first = true;
+                    for (const std::string& change : changes) {
+                        if (first) {
+                            first = false;
+                        } else {
+                            change_str += ", ";
+                        }
+                        change_str += change;
+                    }
+                    ESP_LOGE(TAG, "ignoring status message with unexpected "
+                             "changes without changed bit set: %s",
+                             change_str.c_str());
+                    ignore_message = true;
+                }
+            }
+        }
+
+        if (ignore_message) {
+            return;
+        }
+
+        // Consider slave controller initialized if we received a
+        // status message from the other controller or the unit.
         if (slave_) {
             is_initializing_ = false;
         }
-
-        // Handle simple input sensors first. These are safe to update even if we have a pending
-        // change.
+        waiting_for_first_status = false;
 
         defrost_.publish_state(buffer[3] & 0x4);
         preheat_.publish_state(buffer[3] & 0x8);
@@ -1093,100 +1280,16 @@ private:
             if (fahrenheit_) {
                 room_temp = TempConversion::lgcelsius_to_celsius(room_temp);
             }
-            if (this->current_temperature != room_temp) {
+            if (this->current_temperature < room_temp - .001 ||
+                this->current_temperature > room_temp + .001) {
                 this->current_temperature = room_temp;
                 publish_state();
             }
         }
 
-        // Don't update our settings if we have a pending change/send, because else we overwrite
-        // changes we still have to send (or are sending) to the AC.
-        if (pending_status_change_) {
-            ESP_LOGD(TAG, "ignoring because pending change");
-            return;
-        }
-        if (pending_send_ == PendingSendKind::Status) {
-            ESP_LOGD(TAG, "ignoring because pending send");
-            return;
-        }
-
         if (sender != MessageSender::Slave) {
             memcpy(last_recv_status_, buffer, MsgLen);
         }
-
-        uint8_t b = buffer[1];
-        if ((b & 0x2) == 0) {
-            this->mode = climate::CLIMATE_MODE_OFF;
-        } else {
-            uint8_t mode_val = (b >> 2) & 0b111;
-            switch (mode_val) {
-                case 0:
-                    this->mode = climate::CLIMATE_MODE_COOL;
-                    break;
-                case 1:
-                    this->mode = climate::CLIMATE_MODE_DRY;
-                    break;
-                case 2:
-                    this->mode = climate::CLIMATE_MODE_FAN_ONLY;
-                    break;
-                case 3:
-                    this->mode = climate::CLIMATE_MODE_HEAT_COOL;
-                    break;
-                case 4:
-                    this->mode = climate::CLIMATE_MODE_HEAT;
-                    break;
-                default:
-                    ESP_LOGE(TAG, "received invalid operation mode from AC (%u)", mode_val);
-                    return;
-            }
-        }
-
-        uint8_t fan_val = b >> 5;
-        switch (fan_val) {
-            case 0:
-                this->fan_mode = climate::CLIMATE_FAN_LOW;
-                break;
-            case 1:
-                this->fan_mode = climate::CLIMATE_FAN_MEDIUM;
-                break;
-            case 2:
-                this->fan_mode = climate::CLIMATE_FAN_HIGH;
-                break;
-            case 3:
-                this->fan_mode = climate::CLIMATE_FAN_AUTO;
-                break;
-            case 4:
-                this->fan_mode = climate::CLIMATE_FAN_QUIET;
-                break;
-            default:
-                ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
-                return;
-        }
-
-        purifier_.publish_state(buffer[2] & 0x4);
-
-        bool horiz_swing = buffer[2] & 0x40;
-        bool vert_swing = buffer[2] & 0x80;
-        if (horiz_swing && vert_swing) {
-            set_swing_mode(climate::CLIMATE_SWING_BOTH);
-        } else if (horiz_swing) {
-            set_swing_mode(climate::CLIMATE_SWING_HORIZONTAL);
-        } else if (vert_swing) {
-            set_swing_mode(climate::CLIMATE_SWING_VERTICAL);
-        } else {
-            set_swing_mode(climate::CLIMATE_SWING_OFF);
-        }
-
-        float target = float((buffer[6] & 0xf) + 15);
-        if (buffer[5] & 0x1) {
-            target += 0.5;
-        }
-        if (fahrenheit_) {
-            target = TempConversion::lgcelsius_to_celsius(target);
-        }
-        this->target_temperature = target;
-
-        active_reservation_ = buffer[3] & 0x10;
 
         // Set or clear sleep timer.
         if (sleep_timer_target_millis_.has_value() && !active_reservation_) {
