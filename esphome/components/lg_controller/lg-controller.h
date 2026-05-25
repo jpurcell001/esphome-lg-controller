@@ -189,6 +189,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     bool pending_type_a_settings_change_ = false;
     bool pending_type_b_settings_change_ = false;
     bool pending_type_b_timed_message_ = false;
+    bool operation_mode_changed_ = false;
 
     bool is_initializing_ = true;
 
@@ -470,6 +471,7 @@ public:
     void control(const climate::ClimateCall &call) override {
         if (call.get_mode().has_value()) {
             this->mode = *call.get_mode();
+            operation_mode_changed_ = true;
         }
         if (call.get_target_temperature().has_value()) {
             this->target_temperature = *call.get_target_temperature();
@@ -564,12 +566,15 @@ public:
                 send_type_b_settings_message(/* timed = */ true);
                 pending_type_b_timed_message_ = false;
             } else if (pending_status_change_) {
-                // Send a status message if there is a pending change.
-                // Additionally, queue a Type A message after sending the status message because some
+                send_status_message();
+
+                // Queue a Type A message after sending the status message because some
                 // units set the vane position to the default setting after changing swing mode or
                 // operation mode.
-                send_status_message();
-                pending_type_a_settings_change_ = true;
+                if (operation_mode_changed_) {
+                    pending_type_a_settings_change_ = true;
+                    operation_mode_changed_ = false;
+                }
             }
 
         }
