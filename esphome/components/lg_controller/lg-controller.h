@@ -190,6 +190,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     bool pending_type_b_settings_change_ = false;
     bool pending_type_b_timed_message_ = false;
     bool operation_mode_changed_ = false;
+    bool user_changed_settings_ = false;
 
     bool is_initializing_ = true;
     bool waiting_for_first_status = true;
@@ -200,7 +201,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
 
     optional<uint32_t> sleep_timer_target_millis_{};
     bool active_reservation_ = false;
-    bool ignore_sleep_timer_callback_ = false;
+    bool ignore_callbacks_ = false;
 
     uint32_t NVS_STORAGE_VERSION = 2843654U; // Change version if the NVSStorage struct changes
     struct NVSStorage {
@@ -419,12 +420,23 @@ public:
         });
 
         purifier_.add_on_state_callback([this](bool) {
+            if (ignore_callbacks_) {
+                return;
+            }
+            user_changed_settings_ = true;
             pending_status_change_ = true;
         });
         internal_thermistor_.add_on_state_callback([this](bool) {
+            if (ignore_callbacks_) {
+                return;
+            }
+            user_changed_settings_ = true;
             pending_status_change_ = true;
         });
         auto_dry_.add_on_state_callback([this](bool) {
+            if (ignore_callbacks_) {
+                return;
+            }
             pending_type_a_settings_change_ = true;
         });
     }
@@ -498,6 +510,7 @@ public:
         if (call.get_swing_mode().has_value()) {
             set_swing_mode(*call.get_swing_mode());
         }
+        this->user_changed_settings_ = true;
         this->pending_status_change_ = true;
         this->publish_state();
     }
@@ -583,14 +596,6 @@ public:
                 pending_type_b_timed_message_ = false;
             } else if (pending_status_change_) {
                 send_status_message();
-
-                // Queue a Type A message after sending the status message because some
-                // units set the vane position to the default setting after changing swing mode or
-                // operation mode.
-                if (operation_mode_changed_) {
-                    pending_type_a_settings_change_ = true;
-                    operation_mode_changed_ = false;
-                }
             }
 
         }
@@ -662,7 +667,7 @@ private:
     }
 
     void set_sleep_timer(int minutes) {
-        if (ignore_sleep_timer_callback_) {
+        if (ignore_callbacks_) {
             return;
         }
         // 0 clears the timer. Accept max 7 hours.
@@ -678,6 +683,7 @@ private:
             sleep_timer_target_millis_.reset();
             active_reservation_ = false;
         }
+        user_changed_settings_ = true;
         pending_status_change_ = true;
     }
 
@@ -739,7 +745,7 @@ private:
 
         // Byte 1: changed flag (0x1), power on (0x2), mode (0x1C), fan speed (0x70).
         uint8_t b = 0;
-        if (pending_status_change_) {
+        if (user_changed_settings_) {
             b |= 0x1;
         }
         switch (this->mode) {
@@ -1011,6 +1017,19 @@ private:
 
         if (pending_send_ != PendingSendKind::None && memcmp(send_buf_, buffer, MsgLen) == 0) {
             ESP_LOGD(TAG, "verified send");
+
+            // Queue a Type A message after verifying sending the
+            // status message because some units set the vane position
+            // to the default setting after changing swing mode or
+            // operation mode.
+            if (pending_send_ == PendingSendKind::Status) {
+                if (operation_mode_changed_) {
+                    pending_type_a_settings_change_ = true;
+                    operation_mode_changed_ = false;
+                }
+                user_changed_settings_ = false;
+            }
+
             pending_send_ = PendingSendKind::None;
             return;
         }
@@ -1178,7 +1197,9 @@ private:
                         set_swing_mode(new_swing_mode);
                     }
                     this->target_temperature = target;
+                    ignore_callbacks_ = true;
                     purifier_.publish_state(buffer[2] & 0x4);
+                    ignore_callbacks_ = false;
                     active_reservation_ = buffer[3] & 0x10;
                 }
             }
@@ -1292,12 +1313,14 @@ private:
         }
 
         // Set or clear sleep timer.
+        ignore_callbacks_ = true;
         if (sleep_timer_target_millis_.has_value() && !active_reservation_) {
             sleep_timer_.publish_state(0);
         } else if (((buffer[8] >> 3) & 0x7) == 3) {
             uint32_t minutes = (uint32_t(buffer[8] & 0x7) << 8) | buffer[9];
             sleep_timer_.publish_state(minutes);
         }
+        ignore_callbacks_ = false;
 
         publish_state();
     }
@@ -1382,7 +1405,9 @@ private:
             ESP_LOGE(TAG, "Unexpected vane 4 position: %u", vane4);
         }
 
+        ignore_callbacks_ = true;
         auto_dry_.publish_state(buffer[11] & 0x8);
+        ignore_callbacks_ = false;
 
         if (sender != MessageSender::Slave) {
             // Handle fan speed 0 (slow) change
@@ -1478,17 +1503,17 @@ private:
                 ESP_LOGD(TAG, "Turning off for sleep timer");
                 sleep_timer_target_millis_.reset();
                 active_reservation_= false;
-                ignore_sleep_timer_callback_ = true;
+                ignore_callbacks_ = true;
                 sleep_timer_.publish_state(0);
-                ignore_sleep_timer_callback_ = false;
+                ignore_callbacks_ = false;
                 this->mode = climate::CLIMATE_MODE_OFF;
                 pending_status_change_ = true;
                 publish_state();
             } else if (optional<uint32_t> minutes = get_sleep_timer_minutes()) {
                 if (sleep_timer_.state != *minutes) {
-                    ignore_sleep_timer_callback_ = true;
+                    ignore_callbacks_ = true;
                     sleep_timer_.publish_state(*minutes);
-                    ignore_sleep_timer_callback_ = false;
+                    ignore_callbacks_ = false;
                 }
             }
         }
