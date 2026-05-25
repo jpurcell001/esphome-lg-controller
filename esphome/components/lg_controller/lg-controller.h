@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 #include "esphome.h"
 #include "esphome/components/uart/uart.h"
 
@@ -9,6 +11,10 @@ namespace esphome::lg_controller {
 
 static constexpr size_t MIN_TEMP_SETPOINT = 16;
 static constexpr size_t MAX_TEMP_SETPOINT = 30;
+
+bool float_equal(float a, float b) {
+    return std::abs(a - b) < 0.0001f;
+}
 
 class LgSwitch final : public switch_::Switch {
     void write_state(bool value) override {
@@ -34,7 +40,7 @@ class LgSelect final : public select::Select {
 
 class LgNumber final : public number::Number {
     void control(float value) override {
-        if (this->state != value) {
+        if (!float_equal(this->state, value)) {
             this->publish_state(value); 
         }
     }
@@ -851,7 +857,7 @@ private:
         // Byte 5. Unchanged except for the low bit which indicates the target temperature has a
         // 0.5 fractional part.
         send_buf_[5] = last_recv_status_[5] & ~0x1;
-        if (target - uint8_t(target) == 0.5) {
+        if (float_equal(target - uint8_t(target), 0.5)) {
             send_buf_[5] |= 0x1;
         }
 
@@ -916,7 +922,7 @@ private:
             if (fahrenheit_) {
                 ha_temp = TempConversion::lgcelsius_to_celsius(ha_temp);
             }
-            if (this->current_temperature != ha_temp) {
+            if (!float_equal(this->current_temperature, ha_temp)) {
                 this->current_temperature = ha_temp;
                 publish_state();
             }
@@ -1169,8 +1175,7 @@ private:
         bool fan_mode_changed = this->fan_mode != new_fan_mode;
         bool swing_mode_changed = this->swing_mode != new_swing_mode;
         bool set_temperature_changed =
-            this->target_temperature < target - .001 ||
-            this->target_temperature > target + .001;
+            !float_equal(this->target_temperature, target);
         bool purifier_changed = purifier_.state != new_purifier;
         bool reservation_changed = active_reservation_ != new_active_reservation;
 
@@ -1301,8 +1306,7 @@ private:
             if (fahrenheit_) {
                 room_temp = TempConversion::lgcelsius_to_celsius(room_temp);
             }
-            if (this->current_temperature < room_temp - .001 ||
-                this->current_temperature > room_temp + .001) {
+            if (!float_equal(this->current_temperature, room_temp)) {
                 this->current_temperature = room_temp;
                 publish_state();
             }
@@ -1510,7 +1514,7 @@ private:
                 pending_status_change_ = true;
                 publish_state();
             } else if (optional<uint32_t> minutes = get_sleep_timer_minutes()) {
-                if (sleep_timer_.state != *minutes) {
+                if (!float_equal(sleep_timer_.state, *minutes)) {
                     ignore_callbacks_ = true;
                     sleep_timer_.publish_state(*minutes);
                     ignore_callbacks_ = false;
