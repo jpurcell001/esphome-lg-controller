@@ -1210,42 +1210,42 @@ private:
             !float_equal(this->target_temperature, target);
         bool purifier_changed = purifier_.state != new_purifier;
         bool reservation_changed = active_reservation_ != new_active_reservation;
+        // Don't update our settings if we have a pending change/send,
+        // because else we overwrite changes we still have to send (or
+        // are sending) to the AC.
+        if (user_changed_settings_ &&
+            (pending_status_change_ ||
+             pending_send_ == PendingSendKind::Status)) {
+            ESP_LOGD(TAG, "ignoring incoming settings changes because "
+                     "of an outgoing pending change");
+            return;
+        }
 
         if (changes_allowed) {
             if (mode_changed || fan_mode_changed || swing_mode_changed ||
                 set_temperature_changed || purifier_changed ||
                 reservation_changed) {
-                // Don't update our settings if we have a pending
-                // change/send, because else we overwrite changes we
-                // still have to send (or are sending) to the AC.
-                if (pending_status_change_) {
-                    ESP_LOGD(TAG, "ignoring incoming settings changes because "
-                             "of an outgoing pending change");
-                } else if (pending_send_ == PendingSendKind::Status) {
-                    ESP_LOGD(TAG, "ignoring incoming settings changes because "
-                             "of an outgoing pending send");
-                } else {
-                    if (!settings_changed && repeated_status_override) {
-                        ESP_LOGW(TAG, "accepting settings change without "
-                                 "changed bit set after the same status "
-                                 "message has been received consecutively "
-                                 "%d times", repeated_status_count_);
-                    }
 
-                    this->mode = new_mode;
-                    this->fan_mode = new_fan_mode;
-                    if (swing_mode_changed) {
-                        // Avoid calling set_swing_mode unless the swing mode
-                        // has actually changed, since it sends a 0xAA
-                        // message.
-                        set_swing_mode(new_swing_mode);
-                    }
-                    this->target_temperature = target;
-                    ignore_callbacks_ = true;
-                    purifier_.publish_state(buffer[2] & 0x4);
-                    ignore_callbacks_ = false;
-                    active_reservation_ = buffer[3] & 0x10;
+                if (!settings_changed && repeated_status_override) {
+                    ESP_LOGW(TAG, "accepting settings change without "
+                             "changed bit set after the same status "
+                             "message has been received consecutively "
+                             "%d times", repeated_status_count_);
                 }
+
+                this->mode = new_mode;
+                this->fan_mode = new_fan_mode;
+                if (swing_mode_changed) {
+                    // Avoid calling set_swing_mode unless the swing
+                    // mode has actually changed, since it sends a
+                    // 0xAA message.
+                    set_swing_mode(new_swing_mode);
+                }
+                this->target_temperature = target;
+                ignore_callbacks_ = true;
+                purifier_.publish_state(buffer[2] & 0x4);
+                ignore_callbacks_ = false;
+                active_reservation_ = buffer[3] & 0x10;
             }
         } else {
             std::vector<std::string> changes;
@@ -1269,34 +1269,28 @@ private:
             }
 
             if (changes.size() > 0) {
-                if (pending_status_change_ ||
-                    pending_send_ == PendingSendKind::Status) {
-                    ESP_LOGD(TAG, "ignoring settings in status message "
-                             "due to pending send");
-                } else {
-                    std::string change_str;
-                    bool first = true;
-                    for (const std::string& change : changes) {
-                        if (first) {
-                            first = false;
-                        } else {
-                            change_str += ", ";
-                        }
-                        change_str += change;
+                std::string change_str;
+                bool first = true;
+                for (const std::string& change : changes) {
+                    if (first) {
+                        first = false;
+                    } else {
+                        change_str += ", ";
                     }
-
-                    const char* times = "time";
-                    if (repeated_status_count_ > 1) {
-                        times = "times";
-                    }
-                    ESP_LOGE(TAG, "ignoring status message with unexpected "
-                             "changes without changed bit set: %s; "
-                             "exact message received consecutively %d %s "
-                             "(will be accepted after %d times)",
-                             change_str.c_str(), repeated_status_count_,
-                             times, repeated_status_threshold_);
-                    ignore_message = true;
+                    change_str += change;
                 }
+
+                const char* times = "time";
+                if (repeated_status_count_ > 1) {
+                    times = "times";
+                }
+                ESP_LOGE(TAG, "ignoring status message with unexpected "
+                         "changes without changed bit set: %s; "
+                         "exact message received consecutively %d %s "
+                         "(will be accepted after %d times)",
+                         change_str.c_str(), repeated_status_count_,
+                         times, repeated_status_threshold_);
+                ignore_message = true;
             }
         }
 
