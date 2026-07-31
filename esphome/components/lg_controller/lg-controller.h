@@ -1123,10 +1123,6 @@ private:
         bool changes_allowed = waiting_for_first_status || settings_changed ||
             repeated_status_override;
 
-        // Whether the entire message should be ignored because it is
-        // invalid.
-        bool ignore_message = false;
-
         uint8_t b = buffer[1];
         climate::ClimateMode new_mode;
         if ((b & 0x2) == 0) {
@@ -1151,7 +1147,7 @@ private:
                     break;
                 default:
                     ESP_LOGE(TAG, "received invalid operation mode from AC (%u)", mode_val);
-                    ignore_message = true;
+                    return;
             }
         }
 
@@ -1175,7 +1171,7 @@ private:
                 break;
             default:
                 ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
-                ignore_message = true;
+                return;
         }
 
         bool horiz_swing = buffer[2] & 0x40;
@@ -1290,12 +1286,8 @@ private:
                          "(will be accepted after %d times)",
                          change_str.c_str(), repeated_status_count_,
                          times, repeated_status_threshold_);
-                ignore_message = true;
+                return;
             }
-        }
-
-        if (ignore_message) {
-            return;
         }
 
         // Consider slave controller initialized if we received a
