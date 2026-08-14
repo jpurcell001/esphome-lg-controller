@@ -238,6 +238,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
         FAN_MEDIUM,
         FAN_MEDIUM_HIGH,
         FAN_HIGH,
+        FAN_POWER,
         MODE_HEATING,
         MODE_FAN,
         MODE_AUTO,
@@ -262,6 +263,8 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
                 return (nvs_storage_.capabilities_message[6] & 0x10) != 0;
             case LgCapability::FAN_HIGH:
                 return true;
+            case LgCapability::FAN_POWER:
+                return (nvs_storage_.capabilities_message[3] & 0x02) != 0;
             case LgCapability::MODE_HEATING:
                 return (nvs_storage_.capabilities_message[2] & 0x40) != 0;
             case LgCapability::MODE_FAN:
@@ -293,6 +296,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
         fan_modes.insert(climate::CLIMATE_FAN_MEDIUM);
         fan_modes.insert(climate::CLIMATE_FAN_HIGH);
         fan_modes.insert(climate::CLIMATE_FAN_AUTO);
+        fan_modes.insert(climate::CLIMATE_FAN_FOCUS);
         
         climate::ClimateSwingModeMask swing_modes;
         swing_modes.insert(climate::CLIMATE_SWING_OFF);
@@ -336,6 +340,8 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
                 override_fan_modes.insert(climate::CLIMATE_FAN_MEDIUM);
             if (parse_capability(LgCapability::FAN_HIGH))
                 override_fan_modes.insert(climate::CLIMATE_FAN_HIGH);
+            if (parse_capability(LgCapability::FAN_POWER))
+                override_fan_modes.insert(climate::CLIMATE_FAN_FOCUS);
             supported_traits_.set_supported_fan_modes(override_fan_modes);
 
             climate::ClimateSwingModeMask override_swing_modes;
@@ -816,6 +822,9 @@ private:
                 case climate::CLIMATE_FAN_QUIET:
                     b |= 4 << 5;
                     break;
+                case climate::CLIMATE_FAN_FOCUS:
+                    b |= 7 << 5;
+                    break;
                 default:
                     ESP_LOGE(TAG, "unknown fan mode, using Medium");
                     b |= 1 << 5;
@@ -1180,6 +1189,9 @@ private:
                 break;
             case 4:
                 new_fan_mode = climate::CLIMATE_FAN_QUIET;
+                break;
+            case 7:
+                new_fan_mode = climate::CLIMATE_FAN_FOCUS;
                 break;
             default:
                 ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
