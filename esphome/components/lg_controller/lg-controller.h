@@ -161,6 +161,10 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     esphome::sensor::Sensor& pipe_temp_out_;
     esphome::sensor::Sensor* power_consumption_;
     esphome::sensor::Sensor* current_power_;
+    esphome::sensor::Sensor* humidity_;
+    esphome::sensor::Sensor* fan_operation_time_;
+    esphome::sensor::Sensor* indoor_unit_operation_time_;
+    esphome::sensor::Sensor* precise_room_temperature_;
     esphome::binary_sensor::BinarySensor& defrost_;
     esphome::binary_sensor::BinarySensor& preheat_;
     esphome::binary_sensor::BinarySensor& outdoor_;
@@ -307,7 +311,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
         supported_traits_.set_supported_modes(device_modes);
         supported_traits_.set_supported_fan_modes(fan_modes);
         supported_traits_.set_supported_swing_modes(swing_modes);
-        supported_traits_.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
+        supported_traits_.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE | climate::CLIMATE_SUPPORTS_ACTION);
         supported_traits_.set_visual_min_temperature(MIN_TEMP_SETPOINT);
         supported_traits_.set_visual_max_temperature(MAX_TEMP_SETPOINT);
         supported_traits_.set_visual_current_temperature_step(fahrenheit_ ? 1 : 0.5);
@@ -375,6 +379,10 @@ public:
                  sensor::Sensor* pipe_temp_out,
                  sensor::Sensor* power_consumption,
                  sensor::Sensor* current_power,
+                 sensor::Sensor* humidity,
+                 sensor::Sensor* fan_operation_time,
+                 sensor::Sensor* indoor_unit_operation_time,
+                 sensor::Sensor* precise_room_temperature,
                  binary_sensor::BinarySensor* defrost,
                  binary_sensor::BinarySensor* preheat,
                  binary_sensor::BinarySensor* outdoor,
@@ -401,6 +409,10 @@ public:
         pipe_temp_out_(*pipe_temp_out),
         power_consumption_(power_consumption),
         current_power_(current_power),
+        humidity_(humidity),
+        fan_operation_time_(fan_operation_time),
+        indoor_unit_operation_time_(indoor_unit_operation_time),
+        precise_room_temperature_(precise_room_temperature),
         defrost_(*defrost),
         preheat_(*preheat),
         outdoor_(*outdoor),
@@ -523,6 +535,13 @@ public:
         if (call.get_mode().has_value()) {
             this->mode = *call.get_mode();
             operation_mode_changed_ = true;
+            if (this->mode == climate::CLIMATE_MODE_OFF) {
+                this->action = climate::CLIMATE_ACTION_OFF;
+            } else if (this->mode == climate::CLIMATE_MODE_FAN_ONLY) {
+                this->action = climate::CLIMATE_ACTION_FAN;
+            } else if (this->action == climate::CLIMATE_ACTION_OFF) {
+                this->action = climate::CLIMATE_ACTION_IDLE;
+            }
         }
         if (call.get_target_temperature().has_value()) {
             this->target_temperature = get_roundtrip_target_temperature
@@ -630,6 +649,46 @@ public:
     }
 
 private:
+    bool set_action_from_status_(bool outdoor_on, bool preheating, bool defrosting, uint8_t temperature_flags) {
+        climate::ClimateAction action = climate::CLIMATE_ACTION_IDLE;
+        if (this->mode == climate::CLIMATE_MODE_OFF) {
+            action = climate::CLIMATE_ACTION_OFF;
+        } else if (defrosting) {
+            action = climate::CLIMATE_ACTION_DEFROSTING;
+        } else if (this->mode == climate::CLIMATE_MODE_FAN_ONLY) {
+            action = climate::CLIMATE_ACTION_FAN;
+        } else if (!outdoor_on || preheating) {
+            action = climate::CLIMATE_ACTION_IDLE;
+        } else {
+            switch (this->mode) {
+                case climate::CLIMATE_MODE_COOL:
+                    action = climate::CLIMATE_ACTION_COOLING;
+                    break;
+                case climate::CLIMATE_MODE_DRY:
+                    action = climate::CLIMATE_ACTION_DRYING;
+                    break;
+                case climate::CLIMATE_MODE_HEAT:
+                    action = climate::CLIMATE_ACTION_HEATING;
+                    break;
+                case climate::CLIMATE_MODE_HEAT_COOL:
+                    if (temperature_flags & 0x40) {
+                        action = climate::CLIMATE_ACTION_COOLING;
+                    } else if (temperature_flags & 0x80) {
+                        action = climate::CLIMATE_ACTION_HEATING;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        if (this->action == action) {
+            return false;
+        }
+        this->action = action;
+        return true;
+    }
+
     // Sets position of vane index (1-4) to position (0-6).
     void set_vane_position(int index, int position) {
         if (index < 1 || index > 4) {
@@ -1107,6 +1166,9 @@ private:
             case 4: // 0xCC/AC/2C
                 process_type_c_status_message(*sender, buffer);
                 break;
+            case 6: // 0xCE/AE/2E
+                process_type_e_status_message(*sender, buffer);
+                break;
             case 7: // 0xCF/AF/2F
                 process_type_f_status_message(*sender, buffer);
                 break;
@@ -1322,7 +1384,8 @@ private:
         waiting_for_first_status = false;
 
         defrost_.publish_state(buffer[3] & 0x4);
-        preheat_.publish_state(buffer[3] & 0x8);
+        bool preheating = buffer[3] & 0x8;
+        preheat_.publish_state(preheating);
 
         if (sender == MessageSender::Unit) {
             error_code_.publish_state(buffer[11]);
@@ -1369,6 +1432,21 @@ private:
             }
         }
 
+        // NOTE: PR #172 (upstream) had early "ignoring because pending
+        // change/send" returns here (each still updating the action
+        // telemetry before bailing), matching the pre-#168 control flow.
+        // #168's rearchitecture already removed the equivalent guard from
+        // this location -- the same "don't overwrite a pending outgoing
+        // change" concern is now handled earlier in this function via
+        // user_changed_settings_. Reintroducing pending_status_change_/
+        // pending_send_ checks here would be redundant against that and
+        // would double-guard against #168's now-different semantics for
+        // those flags. Net effect of dropping this hunk: action telemetry
+        // simply updates on the next status message instead of this one,
+        // in the narrow case where this one was a self-echo of a pending
+        // change -- not lost, just deferred by one cycle. The normal-path
+        // set_action_from_status_() call below (unconflicted, from #172)
+        // still runs every time.
         if (sender != MessageSender::Slave) {
             memcpy(last_recv_status_, buffer, MsgLen);
         }
@@ -1383,6 +1461,7 @@ private:
         }
         ignore_callbacks_ = false;
 
+        set_action_from_status_(outdoor_.state, preheating, defrost_.state, buffer[7]);
         publish_state();
     }
 
@@ -1582,6 +1661,29 @@ private:
         }
     }
 
+    static uint16_t decode_uint16_(const uint8_t* buffer, size_t offset) {
+        return (uint16_t(buffer[offset]) << 8) | buffer[offset + 1];
+    }
+
+    void process_type_e_status_message(MessageSender sender, const uint8_t* buffer) {
+        if (sender == MessageSender::Slave || buffer[1] != 0x80) {
+            return;
+        }
+
+        if (humidity_ != nullptr) {
+            humidity_->publish_state(buffer[2]);
+        }
+        if (fan_operation_time_ != nullptr) {
+            fan_operation_time_->publish_state(decode_uint16_(buffer, 3));
+        }
+        if (indoor_unit_operation_time_ != nullptr) {
+            indoor_unit_operation_time_->publish_state(decode_uint16_(buffer, 6));
+        }
+        if (precise_room_temperature_ != nullptr) {
+            precise_room_temperature_->publish_state(float(buffer[10]) + float(buffer[11]) / 10.0f);
+        }
+    }
+
     void update() {
         uint32_t millis_now = millis();
 
@@ -1596,6 +1698,7 @@ private:
                 sleep_timer_.publish_state(0);
                 ignore_callbacks_ = false;
                 this->mode = climate::CLIMATE_MODE_OFF;
+                this->action = climate::CLIMATE_ACTION_OFF;
                 pending_status_change_ = true;
                 publish_state();
             } else if (optional<uint32_t> minutes = get_sleep_timer_minutes()) {
