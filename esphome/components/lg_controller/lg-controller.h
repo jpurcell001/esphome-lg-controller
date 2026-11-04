@@ -245,6 +245,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     sensor::Sensor* unit_reset_reasserts_ = nullptr;
     uint32_t unit_restarts_ = 0;
     sensor::Sensor* unit_restarts_sensor_ = nullptr;
+    sensor::Sensor* reported_fan_speed_ = nullptr;
     uint32_t unit_change_seq_ = 0;
     text_sensor::TextSensor* last_unit_change_ = nullptr;
     // At most this many separate reset events reasserted per window, then accept the
@@ -433,6 +434,7 @@ public:
     void set_reassert_after_unit_reset(bool value) { reassert_after_unit_reset_ = value; }
     void set_unit_reset_reasserts_sensor(sensor::Sensor* s) { unit_reset_reasserts_ = s; }
     void set_unit_restarts_sensor(sensor::Sensor* s) { unit_restarts_sensor_ = s; }
+    void set_reported_fan_speed_sensor(sensor::Sensor* s) { reported_fan_speed_ = s; }
     void set_last_unit_change_text_sensor(text_sensor::TextSensor* s) { last_unit_change_ = s; }
     void set_temperature_control_step_sensor(sensor::Sensor* s) { temperature_control_step_ = s; }
     void set_static_pressure_step_sensor(sensor::Sensor* s) { static_pressure_step_ = s; }
@@ -1963,6 +1965,11 @@ private:
         }
         if (current_power_ != nullptr) {
             current_power_->publish_state(decode_power_uint24_(buffer, 2, 1000.0f));
+        }
+        // Byte 11: the indoor fan's actual running speed (0 = stopped). Found by
+        // stepping LOW/MEDIUM/HIGH on an LVN241HV4 (2026-11-04); see climate.py.
+        if (reported_fan_speed_ != nullptr) {
+            reported_fan_speed_->publish_state(buffer[11]);
         }
     }
 

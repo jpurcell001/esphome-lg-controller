@@ -38,6 +38,7 @@ CONF_OVERCOOLING_SETTING = "overcooling_setting"
 CONF_REASSERT_AFTER_UNIT_RESET = "reassert_after_unit_reset"
 CONF_UNIT_RESET_REASSERTS = "unit_reset_reasserts"
 CONF_UNIT_RESTARTS = "unit_restarts"
+CONF_REPORTED_FAN_SPEED = "reported_fan_speed"
 CONF_LAST_UNIT_CHANGE = "last_unit_change"
 
 CONF_TEMPERATURE_SENSOR = "temperature_sensor"
@@ -106,6 +107,11 @@ CONFIG_SCHEMA = climate.climate_schema(LgController).extend(
         # Count since boot of unit restarts, i.e. unit status resuming after >150 s of silence.
         cv.Optional(CONF_UNIT_RESTARTS): sensor.sensor_schema(
             accuracy_decimals=0, state_class=STATE_CLASS_TOTAL_INCREASING),
+        # The indoor fan's actual running speed, 0xCF byte 11 (undocumented upstream).
+        # Raw value: 0 = fan stopped; on an LVN241HV4 ~47-50 low, 63-64 medium, 70-71
+        # high, and the AUTO setting runs at one of these. Not the fan-speed setting.
+        cv.Optional(CONF_REPORTED_FAN_SPEED): sensor.sensor_schema(
+            accuracy_decimals=0, state_class=STATE_CLASS_MEASUREMENT),
         # Every state change the unit made by itself: "#<n> <adopted|reasserted|gave up> <frame>".
         cv.Optional(CONF_LAST_UNIT_CHANGE): text_sensor.text_sensor_schema(),
 
@@ -279,7 +285,7 @@ async def to_code(config):
     cg.add(var.set_reassert_after_unit_reset(config[CONF_REASSERT_AFTER_UNIT_RESET]))
     for key in (CONF_TEMPERATURE_CONTROL_STEP, CONF_STATIC_PRESSURE_STEP,
                 CONF_CONTINUOUS_FAN, CONF_TEMPERATURE_BASED_FAN_AUTO,
-                CONF_UNIT_RESET_REASSERTS, CONF_UNIT_RESTARTS):
+                CONF_UNIT_RESET_REASSERTS, CONF_UNIT_RESTARTS, CONF_REPORTED_FAN_SPEED):
         if key in config:
             sens = await sensor.new_sensor(config[key])
             cg.add(getattr(var, f"set_{key}_sensor")(sens))
