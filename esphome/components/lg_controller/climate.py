@@ -35,6 +35,10 @@ LgSwitch = lg_controller_ns.class_("LgSwitch", switch.Switch, cg.Component)
 CONF_FAHRENHEIT = "fahrenheit"
 CONF_IS_SLAVE_CONTROLLER = "is_slave_controller"
 CONF_OVERCOOLING_SETTING = "overcooling_setting"
+CONF_REASSERT_AFTER_UNIT_RESET = "reassert_after_unit_reset"
+CONF_UNIT_RESET_REASSERTS = "unit_reset_reasserts"
+CONF_UNIT_RESTARTS = "unit_restarts"
+CONF_LAST_UNIT_CHANGE = "last_unit_change"
 
 CONF_TEMPERATURE_SENSOR = "temperature_sensor"
 
@@ -89,6 +93,21 @@ CONFIG_SCHEMA = climate.climate_schema(LgController).extend(
         cv.Required(CONF_IS_SLAVE_CONTROLLER): cv.boolean,
         # Installer setting 27 to write to the unit (0-3). -1 or omitted = echo the unit's value.
         cv.Optional(CONF_OVERCOOLING_SETTING, default=-1): cv.int_range(min=-1, max=3),
+        # When the unit drops by itself to its reset default (OFF / 18 °C with the changed
+        # bit set -- what it reports going into and coming out of a power interruption),
+        # resend the board's last commanded state instead of adopting the reset, then re-run
+        # the startup exchange and resend it again once that completes. Rate limited; see
+        # LgController::try_reassert_() and request_reinit_().
+        cv.Optional(CONF_REASSERT_AFTER_UNIT_RESET, default=False): cv.boolean,
+        # Count of such reasserts since boot (diagnostic). total_increasing: a board reboot
+        # restarts the count at 0, which reads as a meter reset.
+        cv.Optional(CONF_UNIT_RESET_REASSERTS): sensor.sensor_schema(
+            accuracy_decimals=0, state_class=STATE_CLASS_TOTAL_INCREASING),
+        # Count since boot of unit restarts, i.e. unit status resuming after >150 s of silence.
+        cv.Optional(CONF_UNIT_RESTARTS): sensor.sensor_schema(
+            accuracy_decimals=0, state_class=STATE_CLASS_TOTAL_INCREASING),
+        # Every state change the unit made by itself: "#<n> <adopted|reasserted|gave up> <frame>".
+        cv.Optional(CONF_LAST_UNIT_CHANGE): text_sensor.text_sensor_schema(),
 
         cv.Optional(CONF_TEMPERATURE_SENSOR): cv.use_id(sensor.Sensor),
 
@@ -257,12 +276,14 @@ async def to_code(config):
                            purifier, internal_thermistor, auto_dry,
                            config[CONF_FAHRENHEIT], config[CONF_IS_SLAVE_CONTROLLER])
     cg.add(var.set_overcooling_target(config[CONF_OVERCOOLING_SETTING]))
+    cg.add(var.set_reassert_after_unit_reset(config[CONF_REASSERT_AFTER_UNIT_RESET]))
     for key in (CONF_TEMPERATURE_CONTROL_STEP, CONF_STATIC_PRESSURE_STEP,
-                CONF_CONTINUOUS_FAN, CONF_TEMPERATURE_BASED_FAN_AUTO):
+                CONF_CONTINUOUS_FAN, CONF_TEMPERATURE_BASED_FAN_AUTO,
+                CONF_UNIT_RESET_REASSERTS, CONF_UNIT_RESTARTS):
         if key in config:
             sens = await sensor.new_sensor(config[key])
             cg.add(getattr(var, f"set_{key}_sensor")(sens))
-    for key in (CONF_ADVANCED_SETTINGS_RAW, CONF_EXTENDED_SETTINGS_RAW):
+    for key in (CONF_ADVANCED_SETTINGS_RAW, CONF_EXTENDED_SETTINGS_RAW, CONF_LAST_UNIT_CHANGE):
         if key in config:
             sens = await text_sensor.new_text_sensor(config[key])
             cg.add(getattr(var, f"set_{key}_text_sensor")(sens))

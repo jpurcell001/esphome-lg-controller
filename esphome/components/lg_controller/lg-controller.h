@@ -225,6 +225,48 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     bool is_initializing_ = true;
     bool waiting_for_first_status = true;
 
+    // Reassert-after-unit-reset (opt-in, set_reassert_after_unit_reset). Some units drop
+    // by themselves to OFF / 18 °C with the changed bit set when their supply is
+    // interrupted -- on the way down and again at power-on. Adopting that would leave the
+    // zone off; instead the board resends what it was last told (by HA, a restore from
+    // flash, or a genuine unit-side change). Rate limited so a unit that keeps reverting
+    // is not fought indefinitely (compressor short-cycling).
+    bool reassert_after_unit_reset_ = false;
+    bool have_intended_ = false;
+    climate::ClimateMode intended_mode_ = climate::CLIMATE_MODE_OFF;
+    float intended_target_ = 0;
+    optional<climate::ClimateFanMode> intended_fan_mode_;
+    bool reassert_suspended_ = false;
+    uint8_t reasserts_in_window_ = 0;
+    uint32_t reassert_window_start_millis_ = 0;
+    uint32_t last_reassert_millis_ = 0;
+    uint32_t reassert_total_ = 0;
+    uint32_t last_unit_status_millis_ = 0;
+    sensor::Sensor* unit_reset_reasserts_ = nullptr;
+    uint32_t unit_restarts_ = 0;
+    sensor::Sensor* unit_restarts_sensor_ = nullptr;
+    uint32_t unit_change_seq_ = 0;
+    text_sensor::TextSensor* last_unit_change_ = nullptr;
+    // At most this many separate reset events reasserted per window, then accept the
+    // reset and stop until the unit restarts or HA sends a new command.
+    static const uint8_t max_reasserts_per_window_ = 3;
+    static const uint32_t reassert_window_ms_ = 30UL * 60UL * 1000UL;
+    // Frames of one reset event (the unit repeats each status 2-4 times) within this
+    // long count as a single event.
+    static const uint32_t reassert_event_ms_ = 10UL * 1000UL;
+    // A unit status after this much silence means the unit has restarted.
+    static const uint32_t unit_silence_restart_ms_ = 150UL * 1000UL;
+    // Re-run startup exchange (see request_reinit_()).
+    bool reinit_requested_ = false;
+    uint32_t reinit_requested_millis_ = 0;
+    bool reinit_echo_type_a_ = false;
+    bool reinit_echo_type_b_ = false;
+    // Resend the commanded state this long after the unit's capabilities frame: the rest
+    // of the dump takes ~35 s, and the settings that held came 15-55 s after its start.
+    static const uint32_t reinit_send_delay_ms_ = 20UL * 1000UL;
+    // Give up waiting for the unit's dump after this long if the unit is talking.
+    static const uint32_t reinit_timeout_ms_ = 90UL * 1000UL;
+
     uint8_t vane_position_[4] = {0,0,0,0};
     uint8_t fan_speed_[4] = {0,0,0,0};
     uint8_t overheating_ = 0;
@@ -388,6 +430,10 @@ public:
     void set_overcooling_target(int value) {
         overcooling_target_ = value;
     }
+    void set_reassert_after_unit_reset(bool value) { reassert_after_unit_reset_ = value; }
+    void set_unit_reset_reasserts_sensor(sensor::Sensor* s) { unit_reset_reasserts_ = s; }
+    void set_unit_restarts_sensor(sensor::Sensor* s) { unit_restarts_sensor_ = s; }
+    void set_last_unit_change_text_sensor(text_sensor::TextSensor* s) { last_unit_change_ = s; }
     void set_temperature_control_step_sensor(sensor::Sensor* s) { temperature_control_step_ = s; }
     void set_static_pressure_step_sensor(sensor::Sensor* s) { static_pressure_step_ = s; }
     void set_continuous_fan_sensor(sensor::Sensor* s) { continuous_fan_ = s; }
@@ -541,6 +587,7 @@ public:
             restore->apply(this);
             this->target_temperature = get_roundtrip_target_temperature
                 (this->target_temperature);
+            remember_intended_();
         } else {
             this->mode = climate::CLIMATE_MODE_OFF;
             this->target_temperature = 20;
@@ -550,6 +597,14 @@ public:
         }
 
         internal_thermistor_.restore_and_set_mode(esphome::switch_::SWITCH_RESTORE_DEFAULT_OFF);
+
+        // Counters start from a real 0, not unknown.
+        if (unit_reset_reasserts_ != nullptr) {
+            unit_reset_reasserts_->publish_state(0);
+        }
+        if (unit_restarts_sensor_ != nullptr) {
+            unit_restarts_sensor_->publish_state(0);
+        }
 
         sleep_timer_.publish_state(0);
 
@@ -594,6 +649,10 @@ public:
         }
         this->user_changed_settings_ = true;
         this->pending_status_change_ = true;
+        remember_intended_();
+        // A fresh command from HA re-arms reasserting after a give-up.
+        reassert_suspended_ = false;
+        reasserts_in_window_ = 0;
         this->publish_state();
     }
 
@@ -1359,6 +1418,40 @@ private:
             return;
         }
 
+        if (sender == MessageSender::Unit) {
+            uint32_t now = millis();
+            if (last_unit_status_millis_ != 0 &&
+                now - last_unit_status_millis_ > unit_silence_restart_ms_) {
+                ESP_LOGW(TAG, "unit status resumed after %u s of silence (unit restart)",
+                         unsigned((now - last_unit_status_millis_) / 1000));
+                unit_restarts_++;
+                if (unit_restarts_sensor_ != nullptr) {
+                    unit_restarts_sensor_->publish_state(unit_restarts_);
+                }
+                // A restart re-arms reasserting after a give-up.
+                reassert_suspended_ = false;
+                reasserts_in_window_ = 0;
+                // A re-run exchange pending through the silence waits from now for the
+                // unit's power-on dump.
+                if (reinit_requested_) {
+                    reinit_requested_millis_ = now;
+                }
+            }
+            last_unit_status_millis_ = now;
+
+            // The unit's reset default, reported with the changed bit (or repeated enough
+            // to be adopted without it): don't adopt it if the board was told something
+            // else; resend that instead.
+            if (reassert_after_unit_reset_ && (settings_changed || repeated_status_override) &&
+                have_intended_ &&
+                is_unit_reset_default_(buffer) &&
+                (intended_mode_ != climate::CLIMATE_MODE_OFF ||
+                 !float_equal(intended_target_, target)) &&
+                try_reassert_(buffer)) {
+                return;
+            }
+        }
+
         if (changes_allowed) {
             if (mode_changed || fan_mode_changed || swing_mode_changed ||
                 set_temperature_changed || purifier_changed ||
@@ -1390,6 +1483,11 @@ private:
                 purifier_.publish_state(buffer[2] & 0x4);
                 ignore_callbacks_ = false;
                 active_reservation_ = buffer[3] & 0x10;
+                // A change the unit made that we accepted is now the state to hold.
+                remember_intended_();
+                if (sender == MessageSender::Unit && !waiting_for_first_status) {
+                    note_unit_change_("adopted", buffer);
+                }
             }
         } else {
             std::vector<std::string> changes;
@@ -1527,6 +1625,99 @@ private:
         publish_state();
     }
 
+    // Re-run the exchange the board does at boot: the next status asks the unit for its
+    // settings (byte 8 0x40), its CA/CB are echoed back when they arrive, and the commanded
+    // state is resent with the changed bit reinit_send_delay_ms_ after its capabilities
+    // frame. A setting landing right after such an exchange is what cleared Z6's
+    // post-restart latch each time (2026-10-28, 10-31, 11-04); a plain resend did not.
+    void request_reinit_(const char* why) {
+        if (reinit_requested_) {
+            return;
+        }
+        ESP_LOGW(TAG, "re-running the startup exchange (%s)", why);
+        reinit_requested_ = true;
+        reinit_requested_millis_ = millis();
+        reinit_echo_type_a_ = true;
+        reinit_echo_type_b_ = true;
+        is_initializing_ = true;
+        pending_status_change_ = true;
+    }
+
+    // One line per unit-originated change; the sequence number makes each event a distinct
+    // state in HA's history even when the frame repeats.
+    void note_unit_change_(const char* outcome, const uint8_t* buffer) {
+        unit_change_seq_++;
+        if (last_unit_change_ != nullptr) {
+            last_unit_change_->publish_state("#" + std::to_string(unit_change_seq_) + " " +
+                                             outcome + " " + format_frame_(buffer));
+        }
+    }
+
+    void remember_intended_() {
+        intended_mode_ = this->mode;
+        intended_target_ = this->target_temperature;
+        intended_fan_mode_ = this->fan_mode;
+        have_intended_ = true;
+    }
+
+    // OFF (byte 1 power bit clear) at exactly 18.0 °C (byte 6 low nibble 3, byte 5 half-degree
+    // bit clear), in the unit's own Celsius encoding regardless of fahrenheit_.
+    static bool is_unit_reset_default_(const uint8_t* buffer) {
+        return (buffer[1] & 0x02) == 0 && (buffer[6] & 0x0f) == 3 && (buffer[5] & 0x01) == 0;
+    }
+
+    // Returns true if the reset was answered with a reassert (caller must not adopt it),
+    // false if the rate limit says to accept it.
+    bool try_reassert_(const uint8_t* buffer) {
+        uint32_t now = millis();
+        bool same_event = last_reassert_millis_ != 0 &&
+                          now - last_reassert_millis_ < reassert_event_ms_;
+        if (!same_event) {
+            if (reassert_suspended_) {
+                return false;
+            }
+            if (reasserts_in_window_ == 0 ||
+                now - reassert_window_start_millis_ > reassert_window_ms_) {
+                reassert_window_start_millis_ = now;
+                reasserts_in_window_ = 0;
+            }
+            if (reasserts_in_window_ >= max_reasserts_per_window_) {
+                ESP_LOGE(TAG, "unit reset to OFF / 18 C again after %u reasserts in %u min; "
+                         "accepting it until the unit restarts or HA sends a command",
+                         unsigned(reasserts_in_window_),
+                         unsigned(reassert_window_ms_ / 60000));
+                reassert_suspended_ = true;
+                note_unit_change_("gave up", buffer);
+                return false;
+            }
+            reasserts_in_window_++;
+            reassert_total_++;
+            ESP_LOGW(TAG, "unit dropped to its reset default (OFF / 18 C, changed bit): %s; "
+                     "reasserting the commanded state (%u of %u in this window)",
+                     format_hex_pretty(buffer, MsgLen).c_str(),
+                     unsigned(reasserts_in_window_), unsigned(max_reasserts_per_window_));
+            if (unit_reset_reasserts_ != nullptr) {
+                unit_reset_reasserts_->publish_state(reassert_total_);
+            }
+            note_unit_change_("reasserted", buffer);
+            request_reinit_("unit reset to OFF / 18 C");
+            // Anchored to the event's first frame, so a steady stream of resets can't
+            // keep extending one "event" past the rate limit.
+            last_reassert_millis_ = now;
+        }
+
+        this->mode = intended_mode_;
+        this->target_temperature = intended_target_;
+        this->fan_mode = intended_fan_mode_;
+        unit_fan_raw_ = 0xFF;
+        // Keep the bytes we echo back (3, 4, 5, 10, 11) current.
+        memcpy(last_recv_status_, buffer, MsgLen);
+        user_changed_settings_ = true;
+        pending_status_change_ = true;
+        publish_state();
+        return true;
+    }
+
     void process_capabilities_message(MessageSender sender, const uint8_t* buffer) {
         // Capabilities message. The unit sends this with the other settings so we're now
         // initialized.
@@ -1559,12 +1750,33 @@ private:
         }
 
         is_initializing_ = false;
+
+        // A re-run startup exchange is complete once the unit's capabilities frame arrives
+        // (requested, or sent by the unit on its own at power-on): resend the commanded
+        // state with the changed bit, a little after the rest of the dump.
+        if (reinit_requested_) {
+            reinit_requested_ = false;
+            set_timeout("reinit_send", reinit_send_delay_ms_, [this]() {
+                if (have_intended_) {
+                    this->mode = intended_mode_;
+                    this->target_temperature = intended_target_;
+                    this->fan_mode = intended_fan_mode_;
+                    unit_fan_raw_ = 0xFF;
+                }
+                ESP_LOGW(TAG, "startup exchange done; resending the commanded state");
+                user_changed_settings_ = true;
+                pending_status_change_ = true;
+                publish_state();
+            });
+        }
     }
 
     void process_type_a_settings_message(MessageSender sender, const uint8_t* buffer) {
-        // Send settings the first time we receive a 0xCA message.
+        // Send settings the first time we receive a 0xCA message (or the first after a
+        // re-run startup exchange).
         if (sender != MessageSender::Slave) {
-            bool first_time = last_recv_type_a_settings_[0] == 0;
+            bool first_time = last_recv_type_a_settings_[0] == 0 || reinit_echo_type_a_;
+            reinit_echo_type_a_ = false;
             memcpy(last_recv_type_a_settings_, buffer, MsgLen);
             if (first_time) {
                 pending_type_a_settings_change_ = true;
@@ -1636,8 +1848,10 @@ private:
             return;
         }
 
-        // Send installer settings the first time we receive a 0xCB message.
-        bool first_time = last_recv_type_b_settings_[0] == 0;
+        // Send installer settings the first time we receive a 0xCB message (or the first
+        // after a re-run startup exchange).
+        bool first_time = last_recv_type_b_settings_[0] == 0 || reinit_echo_type_b_;
+        reinit_echo_type_b_ = false;
         memcpy(last_recv_type_b_settings_, buffer, MsgLen);
         if (first_time) {
             pending_type_b_settings_change_ = true;
@@ -1853,6 +2067,7 @@ private:
                 this->mode = climate::CLIMATE_MODE_OFF;
                 this->action = climate::CLIMATE_ACTION_OFF;
                 pending_status_change_ = true;
+                remember_intended_();
                 publish_state();
             } else if (optional<uint32_t> minutes = get_sleep_timer_minutes()) {
                 if (!float_equal(sleep_timer_.state, *minutes)) {
@@ -1870,6 +2085,18 @@ private:
         // Send an AB message every 10 minutes to request pipe temperature values.
         if (!slave_ && millis_now - last_sent_recv_type_b_millis_ > 10 * 60 * 1000) {
             pending_type_b_timed_message_ = true;
+        }
+
+        // A re-run startup exchange whose dump never came while the unit was talking: stop
+        // asking, so is_initializing_ can't stick.
+        if (reinit_requested_ && millis_now - reinit_requested_millis_ > reinit_timeout_ms_ &&
+            last_unit_status_millis_ != 0 &&
+            millis_now - last_unit_status_millis_ < reinit_timeout_ms_) {
+            ESP_LOGE(TAG, "unit sent no settings dump after the re-run startup exchange; giving up");
+            reinit_requested_ = false;
+            reinit_echo_type_a_ = false;
+            reinit_echo_type_b_ = false;
+            is_initializing_ = false;
         }
 
         // Send a status message every 20 seconds.
