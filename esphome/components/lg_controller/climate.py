@@ -108,8 +108,9 @@ CONFIG_SCHEMA = climate.climate_schema(LgController).extend(
         cv.Optional(CONF_UNIT_RESTARTS): sensor.sensor_schema(
             accuracy_decimals=0, state_class=STATE_CLASS_TOTAL_INCREASING),
         # The indoor fan's actual running speed, 0xCF byte 11 (undocumented upstream).
-        # Raw value: 0 = fan stopped; on an LVN241HV4 ~47-50 low, 63-64 medium, 70-71
-        # high, and the AUTO setting runs at one of these. Not the fan-speed setting.
+        # Value = indoor airflow in tens of CFM, 0 = fan stopped: an LVN241HV4 reads
+        # 71/64/48 (rated H/M/L 710/640/480 CFM), an LVN181HV4 58 at medium (640/580/480).
+        # The AUTO setting runs at one of these steps. Not the fan-speed setting.
         cv.Optional(CONF_REPORTED_FAN_SPEED): sensor.sensor_schema(
             accuracy_decimals=0, state_class=STATE_CLASS_MEASUREMENT),
         # Every state change the unit made by itself: "#<n> <adopted|reasserted|gave up> <frame>".
