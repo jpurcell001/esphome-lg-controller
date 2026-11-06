@@ -1434,7 +1434,8 @@ private:
             (pending_status_change_ ||
              pending_send_ == PendingSendKind::Status)) {
             if (sender == MessageSender::Slave && settings_changed) {
-                // LG controllers send each change twice, so the repeat usually lands.
+                // The controller repeats its final state ~1.5 s later, so the end
+                // state usually lands even if this frame is dropped.
                 ESP_LOGW(TAG, "wall controller change not applied: an outgoing change "
                          "is pending");
             } else {
@@ -1494,8 +1495,9 @@ private:
                 // A deliberate change at a slave wall controller (changed bit set; never
                 // the repeated-message override). Swing is ignored: the controller sets
                 // its own swing bits even on units without vanes, and the unit corrects
-                // them. The controller sends each change twice; the repeat matches the
-                // state adopted here, so it changes nothing and fires nothing.
+                // them. One frame per press; the controller repeats its final state
+                // ~1.5 s later, which matches the state adopted here, so it changes
+                // nothing and fires nothing.
                 if (sender == MessageSender::Slave && settings_changed &&
                     !waiting_for_first_status) {
                     if (mode_changed) {
