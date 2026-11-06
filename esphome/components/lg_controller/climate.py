@@ -1,10 +1,11 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome import pins
+from esphome import automation, pins
 from esphome.components import binary_sensor, climate, number, select, sensor, switch, text_sensor, uart
 from esphome.const import (
     CONF_ID,
     CONF_RX_PIN,
+    CONF_TRIGGER_ID,
     CONF_INTERNAL,
     DEVICE_CLASS_DURATION,
     DEVICE_CLASS_ENERGY,
@@ -31,6 +32,9 @@ LgController = lg_controller_ns.class_(
 LgNumber = lg_controller_ns.class_("LgNumber", number.Number, cg.Component)
 LgSelect = lg_controller_ns.class_("LgSelect", select.Select, cg.Component)
 LgSwitch = lg_controller_ns.class_("LgSwitch", switch.Switch, cg.Component)
+WallControllerChangeTrigger = lg_controller_ns.class_(
+    "WallControllerChangeTrigger", automation.Trigger.template(cg.std_string)
+)
 
 CONF_FAHRENHEIT = "fahrenheit"
 CONF_IS_SLAVE_CONTROLLER = "is_slave_controller"
@@ -41,6 +45,7 @@ CONF_UNIT_RESTARTS = "unit_restarts"
 CONF_REPORTED_FAN_SPEED = "reported_fan_speed"
 CONF_FILTER_HOURS_LEFT = "filter_hours_left"
 CONF_LAST_UNIT_CHANGE = "last_unit_change"
+CONF_ON_WALL_CONTROLLER_CHANGE = "on_wall_controller_change"
 
 CONF_TEMPERATURE_SENSOR = "temperature_sensor"
 
@@ -123,6 +128,12 @@ CONFIG_SCHEMA = climate.climate_schema(LgController).extend(
             state_class=STATE_CLASS_MEASUREMENT),
         # Every state change the unit made by itself: "#<n> <adopted|reasserted|gave up> <frame>".
         cv.Optional(CONF_LAST_UNIT_CHANGE): text_sensor.text_sensor_schema(),
+        # A slave (secondary) wall controller on the bus changed a setting. Variable
+        # `change` (std::string): "setpoint", "mode", "power" (on/off) or "fan". Fires
+        # once per setting, after the climate state is published. Master mode only.
+        cv.Optional(CONF_ON_WALL_CONTROLLER_CHANGE): automation.validate_automation(
+            {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(WallControllerChangeTrigger)}
+        ),
 
         cv.Optional(CONF_TEMPERATURE_SENSOR): cv.use_id(sensor.Sensor),
 
@@ -315,6 +326,9 @@ async def to_code(config):
         if key in config:
             sens = await text_sensor.new_text_sensor(config[key])
             cg.add(getattr(var, f"set_{key}_text_sensor")(sens))
+    for conf in config.get(CONF_ON_WALL_CONTROLLER_CHANGE, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(trigger, [(cg.std_string, "change")], conf)
     await climate.register_climate(var, config)
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)

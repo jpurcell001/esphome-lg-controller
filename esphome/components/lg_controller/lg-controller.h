@@ -251,6 +251,9 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     sensor::Sensor* filter_hours_left_ = nullptr;
     uint32_t unit_change_seq_ = 0;
     text_sensor::TextSensor* last_unit_change_ = nullptr;
+    // Fired for each setting a slave (secondary) wall controller changed: "setpoint",
+    // "mode", "power" or "fan". See process_status_message.
+    CallbackManager<void(const std::string&)> wall_controller_change_callback_;
     // At most this many separate reset events reasserted per window, then accept the
     // reset and stop until the unit restarts or HA sends a new command.
     static const uint8_t max_reasserts_per_window_ = 3;
@@ -440,6 +443,9 @@ public:
     void set_reported_fan_speed_sensor(sensor::Sensor* s) { reported_fan_speed_ = s; }
     void set_filter_hours_left_sensor(sensor::Sensor* s) { filter_hours_left_ = s; }
     void set_last_unit_change_text_sensor(text_sensor::TextSensor* s) { last_unit_change_ = s; }
+    void add_on_wall_controller_change_callback(std::function<void(const std::string&)>&& cb) {
+        wall_controller_change_callback_.add(std::move(cb));
+    }
     void set_temperature_control_step_sensor(sensor::Sensor* s) { temperature_control_step_ = s; }
     void set_static_pressure_step_sensor(sensor::Sensor* s) { static_pressure_step_ = s; }
     void set_continuous_fan_sensor(sensor::Sensor* s) { continuous_fan_ = s; }
@@ -1427,8 +1433,14 @@ private:
         if (user_changed_settings_ &&
             (pending_status_change_ ||
              pending_send_ == PendingSendKind::Status)) {
-            ESP_LOGD(TAG, "ignoring incoming settings changes because "
-                     "of an outgoing pending change");
+            if (sender == MessageSender::Slave && settings_changed) {
+                // LG controllers send each change twice, so the repeat usually lands.
+                ESP_LOGW(TAG, "wall controller change not applied: an outgoing change "
+                         "is pending");
+            } else {
+                ESP_LOGD(TAG, "ignoring incoming settings changes because "
+                         "of an outgoing pending change");
+            }
             return;
         }
 
@@ -1466,6 +1478,7 @@ private:
             }
         }
 
+        std::vector<const char*> wall_changes;
         if (changes_allowed) {
             if (mode_changed || fan_mode_changed || swing_mode_changed ||
                 set_temperature_changed || purifier_changed ||
@@ -1476,6 +1489,26 @@ private:
                              "changed bit set after the same status "
                              "message has been received consecutively "
                              "%d times", repeated_status_count_);
+                }
+
+                // A deliberate change at a slave wall controller (changed bit set; never
+                // the repeated-message override). Swing is ignored: the controller sets
+                // its own swing bits even on units without vanes, and the unit corrects
+                // them. The controller sends each change twice; the repeat matches the
+                // state adopted here, so it changes nothing and fires nothing.
+                if (sender == MessageSender::Slave && settings_changed &&
+                    !waiting_for_first_status) {
+                    if (mode_changed) {
+                        bool was_off = this->mode == climate::CLIMATE_MODE_OFF;
+                        bool now_off = new_mode == climate::CLIMATE_MODE_OFF;
+                        wall_changes.push_back(was_off != now_off ? "power" : "mode");
+                    }
+                    if (fan_mode_changed) {
+                        wall_changes.push_back("fan");
+                    }
+                    if (set_temperature_changed) {
+                        wall_changes.push_back("setpoint");
+                    }
                 }
 
                 this->mode = new_mode;
@@ -1637,6 +1670,13 @@ private:
 
         set_action_from_status_(outdoor_.state, preheating, defrost_.state, buffer[7]);
         publish_state();
+
+        // After publish_state(), so a listener reading the climate state sees the change.
+        for (const char* what : wall_changes) {
+            ESP_LOGI(TAG, "wall controller changed %s (setpoint now %.1f C)", what,
+                     this->target_temperature);
+            wall_controller_change_callback_.call(std::string(what));
+        }
     }
 
     // Re-run the exchange the board does at boot: the next status asks the unit for its
@@ -2143,6 +2183,15 @@ private:
         if (!slave_ && millis_now - last_sent_status_millis_ > 20 * 1000) {
             pending_status_change_ = true;
         }
+    }
+};
+
+// on_wall_controller_change: `change` is "setpoint", "mode", "power" or "fan".
+class WallControllerChangeTrigger : public Trigger<std::string> {
+  public:
+    explicit WallControllerChangeTrigger(LgController* parent) {
+        parent->add_on_wall_controller_change_callback(
+            [this](const std::string& change) { this->trigger(change); });
     }
 };
 
