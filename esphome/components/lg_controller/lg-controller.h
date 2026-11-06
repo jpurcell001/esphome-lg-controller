@@ -174,6 +174,8 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     esphome::sensor::Sensor* temperature_based_fan_auto_ = nullptr;
     esphome::text_sensor::TextSensor* advanced_settings_raw_ = nullptr;
     esphome::text_sensor::TextSensor* extended_settings_raw_ = nullptr;
+    esphome::text_sensor::TextSensor* installer_settings_raw_ = nullptr;
+    esphome::text_sensor::TextSensor* capabilities_raw_ = nullptr;
 
     // Last 0xCE.00/10/11/12 sub-frames from the unit, for extended_settings_raw.
     uint8_t last_recv_type_e_settings_[4][MsgLen] = {};
@@ -246,6 +248,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     uint32_t unit_restarts_ = 0;
     sensor::Sensor* unit_restarts_sensor_ = nullptr;
     sensor::Sensor* reported_fan_speed_ = nullptr;
+    sensor::Sensor* filter_hours_left_ = nullptr;
     uint32_t unit_change_seq_ = 0;
     text_sensor::TextSensor* last_unit_change_ = nullptr;
     // At most this many separate reset events reasserted per window, then accept the
@@ -435,6 +438,7 @@ public:
     void set_unit_reset_reasserts_sensor(sensor::Sensor* s) { unit_reset_reasserts_ = s; }
     void set_unit_restarts_sensor(sensor::Sensor* s) { unit_restarts_sensor_ = s; }
     void set_reported_fan_speed_sensor(sensor::Sensor* s) { reported_fan_speed_ = s; }
+    void set_filter_hours_left_sensor(sensor::Sensor* s) { filter_hours_left_ = s; }
     void set_last_unit_change_text_sensor(text_sensor::TextSensor* s) { last_unit_change_ = s; }
     void set_temperature_control_step_sensor(sensor::Sensor* s) { temperature_control_step_ = s; }
     void set_static_pressure_step_sensor(sensor::Sensor* s) { static_pressure_step_ = s; }
@@ -442,6 +446,8 @@ public:
     void set_temperature_based_fan_auto_sensor(sensor::Sensor* s) { temperature_based_fan_auto_ = s; }
     void set_advanced_settings_raw_text_sensor(text_sensor::TextSensor* s) { advanced_settings_raw_ = s; }
     void set_extended_settings_raw_text_sensor(text_sensor::TextSensor* s) { extended_settings_raw_ = s; }
+    void set_installer_settings_raw_text_sensor(text_sensor::TextSensor* s) { installer_settings_raw_ = s; }
+    void set_capabilities_raw_text_sensor(text_sensor::TextSensor* s) { capabilities_raw_ = s; }
 
     LgController(InternalGPIOPin* rx_pin,
                  sensor::Sensor* temperature_sensor,
@@ -612,6 +618,12 @@ public:
 
         // Configure climate traits and entities based on the capabilities message (if available)
         configure_capabilities();
+
+        // The unit sends 0xC9 only in the startup exchange, so start from the copy kept in
+        // NVS; process_capabilities_message() republishes if the unit's frame differs.
+        if (nvs_storage_.capabilities_message[0] != 0) {
+            publish_if_changed_(capabilities_raw_, format_frame_(nvs_storage_.capabilities_message));
+        }
 
         while (UARTDevice::available() > 0) {
             uint8_t b;
@@ -1729,6 +1741,8 @@ private:
             return;
         }
 
+        publish_if_changed_(capabilities_raw_, format_frame_(buffer));
+
         // Check if we need to update the capabilities message.
         if (nvs_storage_.capabilities_message[0] == 0 ||
             std::memcmp(nvs_storage_.capabilities_message, buffer, MsgLen - 1) != 0) {
@@ -1898,6 +1912,17 @@ private:
         if (static_pressure_step_ != nullptr) {
             static_pressure_step_->publish_state(buffer[10] & 0x0F);
         }
+        // Raw frame for decoding (model/capacity codes in bytes 8-9). The pipe temperatures
+        // (bytes 3-5) and so the checksum (byte 12) change every frame and have their own
+        // sensors, so they are masked: the text then changes only with a setting.
+        if (installer_settings_raw_ != nullptr) {
+            std::string raw = format_frame_(buffer);
+            for (size_t i : {size_t(3), size_t(4), size_t(5), MsgLen - 1}) {
+                raw[i * 3] = '-';
+                raw[i * 3 + 1] = '-';
+            }
+            publish_if_changed_(installer_settings_raw_, raw);
+        }
 
         // Table mapping a byte value to degrees Celsius based on values displayed by PREMTB100.
         // INT8_MIN indicates an invalid value.
@@ -1956,6 +1981,11 @@ private:
         }
         if (power_consumption_ != nullptr) {
             power_consumption_->publish_state(decode_power_uint24_(buffer, 3, 10.0f));
+        }
+        // Bytes 1-2: filter time left in hours, 12 bits (byte 2 bits 6-7 are other flags).
+        // Counts down one per hour of the unit being ON (Z6 capture, 2026-11-06).
+        if (filter_hours_left_ != nullptr) {
+            filter_hours_left_->publish_state(((buffer[2] & 0x0F) << 8) | buffer[1]);
         }
     }
 
@@ -2050,6 +2080,8 @@ private:
         if (fan_operation_time_ != nullptr) {
             fan_operation_time_->publish_state(decode_uint16_(buffer, 3));
         }
+        // Bytes 6-7: upstream's "IDU operation time", but on our units it counts hours with
+        // mains power (it ticks while OFF), not hours ON. Name kept; see climate.py.
         if (indoor_unit_operation_time_ != nullptr) {
             indoor_unit_operation_time_->publish_state(decode_uint16_(buffer, 6));
         }

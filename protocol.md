@@ -345,6 +345,8 @@ AE.80.3C.0F.17.00.2A.74.02.00.12.04.13
 - byte 12:     checksum
 ```
 
+Note (jpurcell-integration, 2026-11-06): on LVN241HV4/LVN181HV4 ducted units, bytes 6-7 count hours the unit has had mains power, not hours it was ON: the counter ticked hourly while the unit was OFF and stopped only during power outages. Bytes 3-4 track fan running hours. The `indoor_unit_operation_time` sensor keeps its name but reports this powered-hours counter.
+
 ## Type 7: More status information (0xAF/0xCF)
 Used by newer units and controllers. Contains unit's current power usage among other things. Some examples from PREMTB100:
 ```

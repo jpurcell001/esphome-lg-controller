@@ -39,6 +39,7 @@ CONF_REASSERT_AFTER_UNIT_RESET = "reassert_after_unit_reset"
 CONF_UNIT_RESET_REASSERTS = "unit_reset_reasserts"
 CONF_UNIT_RESTARTS = "unit_restarts"
 CONF_REPORTED_FAN_SPEED = "reported_fan_speed"
+CONF_FILTER_HOURS_LEFT = "filter_hours_left"
 CONF_LAST_UNIT_CHANGE = "last_unit_change"
 
 CONF_TEMPERATURE_SENSOR = "temperature_sensor"
@@ -73,6 +74,8 @@ CONF_CONTINUOUS_FAN = "continuous_fan"
 CONF_TEMPERATURE_BASED_FAN_AUTO = "temperature_based_fan_auto"
 CONF_ADVANCED_SETTINGS_RAW = "advanced_settings_raw"
 CONF_EXTENDED_SETTINGS_RAW = "extended_settings_raw"
+CONF_INSTALLER_SETTINGS_RAW = "installer_settings_raw"
+CONF_CAPABILITIES_RAW = "capabilities_raw"
 
 CONF_DEFROST = "defrost"
 CONF_PREHEAT = "preheat"
@@ -113,6 +116,11 @@ CONFIG_SCHEMA = climate.climate_schema(LgController).extend(
         # The AUTO setting runs at one of these steps. Not the fan-speed setting.
         cv.Optional(CONF_REPORTED_FAN_SPEED): sensor.sensor_schema(
             accuracy_decimals=0, state_class=STATE_CLASS_MEASUREMENT),
+        # Filter time left in hours, 0xCC bytes 1-2 (12 bits). Counts down one per hour
+        # of the unit being ON (compressor or not). Units that send no 0xCC never publish.
+        cv.Optional(CONF_FILTER_HOURS_LEFT): sensor.sensor_schema(
+            unit_of_measurement=UNIT_HOUR, accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT),
         # Every state change the unit made by itself: "#<n> <adopted|reasserted|gave up> <frame>".
         cv.Optional(CONF_LAST_UNIT_CHANGE): text_sensor.text_sensor_schema(),
 
@@ -158,6 +166,9 @@ CONFIG_SCHEMA = climate.climate_schema(LgController).extend(
             device_class=DEVICE_CLASS_DURATION,
             state_class=STATE_CLASS_TOTAL_INCREASING,
         ),
+        # 0xCE.80 bytes 6-7. protocol.md calls it "IDU operation time", but on our LVN
+        # units it counts hours the unit has had mains power, ON or OFF (it ticks while
+        # OFF and stops during outages; jpurcell-integration 2026-11-06). Key kept as is.
         cv.Optional(CONF_INDOOR_UNIT_OPERATION_TIME): sensor.sensor_schema(
             unit_of_measurement=UNIT_HOUR,
             accuracy_decimals=0,
@@ -183,6 +194,14 @@ CONFIG_SCHEMA = climate.climate_schema(LgController).extend(
         # partly documented. Published only when they change.
         cv.Optional(CONF_ADVANCED_SETTINGS_RAW): text_sensor.text_sensor_schema(),
         cv.Optional(CONF_EXTENDED_SETTINGS_RAW): text_sensor.text_sensor_schema(),
+        # Raw hex of the unit's 0xCB frame with the pipe temperatures (bytes 3-5) and the
+        # checksum (byte 12) shown as "--", so it changes only when a setting or the
+        # model/capacity codes (bytes 8-9) do, not every time a pipe temperature moves.
+        cv.Optional(CONF_INSTALLER_SETTINGS_RAW): text_sensor.text_sensor_schema(),
+        # Raw hex of the unit's 0xC9 capabilities frame. The unit sends it only in the
+        # startup exchange, so it is published from the stored copy at boot and again
+        # when a new frame arrives.
+        cv.Optional(CONF_CAPABILITIES_RAW): text_sensor.text_sensor_schema(),
 
         cv.Required(CONF_DEFROST): binary_sensor.binary_sensor_schema(),
         cv.Required(CONF_PREHEAT): binary_sensor.binary_sensor_schema(),
@@ -286,11 +305,13 @@ async def to_code(config):
     cg.add(var.set_reassert_after_unit_reset(config[CONF_REASSERT_AFTER_UNIT_RESET]))
     for key in (CONF_TEMPERATURE_CONTROL_STEP, CONF_STATIC_PRESSURE_STEP,
                 CONF_CONTINUOUS_FAN, CONF_TEMPERATURE_BASED_FAN_AUTO,
-                CONF_UNIT_RESET_REASSERTS, CONF_UNIT_RESTARTS, CONF_REPORTED_FAN_SPEED):
+                CONF_UNIT_RESET_REASSERTS, CONF_UNIT_RESTARTS, CONF_REPORTED_FAN_SPEED,
+                CONF_FILTER_HOURS_LEFT):
         if key in config:
             sens = await sensor.new_sensor(config[key])
             cg.add(getattr(var, f"set_{key}_sensor")(sens))
-    for key in (CONF_ADVANCED_SETTINGS_RAW, CONF_EXTENDED_SETTINGS_RAW, CONF_LAST_UNIT_CHANGE):
+    for key in (CONF_ADVANCED_SETTINGS_RAW, CONF_EXTENDED_SETTINGS_RAW, CONF_LAST_UNIT_CHANGE,
+                CONF_INSTALLER_SETTINGS_RAW, CONF_CAPABILITIES_RAW):
         if key in config:
             sens = await text_sensor.new_text_sensor(config[key])
             cg.add(getattr(var, f"set_{key}_text_sensor")(sens))
