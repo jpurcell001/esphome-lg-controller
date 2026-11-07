@@ -304,6 +304,14 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     int8_t external_ventilation_ = -1;
     bool ignore_callbacks_ = false;
 
+    // The unit's own view from its last status frame (unit_blower_running).
+    climate::ClimateMode unit_mode_ = climate::CLIMATE_MODE_OFF;
+    bool unit_compressor_on_ = false;
+    bool unit_preheat_ = false;
+    bool unit_defrost_ = false;
+    uint8_t unit_error_ = 0;
+    uint32_t unit_view_millis_ = 0;
+
     // Dehumidifier assist (set_assist). Persisted with the intent it is holding, because
     // the climate's own restore saves the displayed FAN_ONLY state.
     bool assist_active_ = false;
@@ -503,6 +511,27 @@ public:
         this->publish_state();
     }
     bool is_assist_active() const { return assist_active_; }
+    // From the unit's last status frame (not the optimistic commanded state). The indoor
+    // blower runs in FAN_ONLY, and with the compressor on in any other mode except during
+    // hot-start preheat and defrost, which hold it off. A unit reporting an error is not
+    // trusted to be moving air. False until the unit has sent a status frame.
+    bool unit_blower_running() const {
+        if (unit_view_millis_ == 0 || unit_error_ != 0 ||
+            unit_mode_ == climate::CLIMATE_MODE_OFF) {
+            return false;
+        }
+        if (unit_mode_ == climate::CLIMATE_MODE_FAN_ONLY) {
+            return true;
+        }
+        return unit_compressor_on_ && !unit_preheat_ && !unit_defrost_;
+    }
+    bool unit_compressor_on() const {
+        return unit_view_millis_ != 0 && unit_mode_ != climate::CLIMATE_MODE_OFF &&
+               unit_compressor_on_;
+    }
+    bool unit_reports_fan_only() const {
+        return unit_view_millis_ != 0 && unit_mode_ == climate::CLIMATE_MODE_FAN_ONLY;
+    }
     climate::ClimateMode get_intended_mode() const {
         return have_intended_ ? intended_mode_ : this->mode;
     }
@@ -698,6 +727,12 @@ public:
             remember_intended_();
             if (had_assist) {
                 save_assist_();  // clears the stored flag
+                // The unit is still running the FAN_ONLY we left it in, and the first unit
+                // status after boot is normally adopted as-is -- which would make FAN_ONLY the
+                // intent (Z3, 2026-11-07). Send the restored intent as a change instead, so
+                // incoming frames are ignored until the unit has taken it.
+                user_changed_settings_ = true;
+                operation_mode_changed_ = true;
             }
         } else {
             this->mode = climate::CLIMATE_MODE_OFF;
@@ -1490,6 +1525,17 @@ private:
                     ESP_LOGE(TAG, "received invalid operation mode from AC (%u)", mode_val);
                     return;
             }
+        }
+
+        // The unit's own view, from every unit frame (before any early return below): what
+        // it is actually doing, as distinct from this->mode, which is what we commanded.
+        if (sender == MessageSender::Unit) {
+            unit_mode_ = new_mode;
+            unit_compressor_on_ = buffer[5] & 0x4;
+            unit_preheat_ = buffer[3] & 0x8;
+            unit_defrost_ = buffer[3] & 0x4;
+            unit_error_ = buffer[11];
+            unit_view_millis_ = millis();
         }
 
         uint8_t fan_val = b >> 5;
