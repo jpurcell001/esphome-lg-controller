@@ -297,6 +297,11 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
 
     optional<uint32_t> sleep_timer_target_millis_{};
     bool active_reservation_ = false;
+
+    // Status-frame byte 3 bit 0, "external ventilation is on": -1 = echo the unit's value
+    // (default), 0 = send clear, 1 = send set. Under installer setting 38 (fan interlocked
+    // with ventilation) the unit may run its blower while this is set.
+    int8_t external_ventilation_ = -1;
     bool ignore_callbacks_ = false;
 
     uint32_t NVS_STORAGE_VERSION = 2843654U; // Change version if the NVSStorage struct changes
@@ -439,6 +444,13 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     }
 
 public:
+    // Request (or release) "external ventilation is on" in our status frames.
+    void set_external_ventilation(bool on) {
+        ESP_LOGI(TAG, "External ventilation bit: %s", on ? "set" : "clear");
+        external_ventilation_ = on ? 1 : 0;
+        user_changed_settings_ = true;
+        pending_status_change_ = true;
+    }
     void set_overcooling_target(int value) {
         overcooling_target_ = value;
     }
@@ -1054,6 +1066,11 @@ private:
             send_buf_[3] |= 0x10;
         } else {
             send_buf_[3] &= ~0x10;
+        }
+        if (external_ventilation_ == 1) {
+            send_buf_[3] |= 0x01;
+        } else if (external_ventilation_ == 0) {
+            send_buf_[3] &= ~0x01;
         }
 
         // Byte 4.
