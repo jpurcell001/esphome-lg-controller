@@ -311,6 +311,9 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     bool unit_defrost_ = false;
     uint8_t unit_error_ = 0;
     uint32_t unit_view_millis_ = 0;
+    // Booted with an assist stored (setup): see process_status_message.
+    bool boot_from_assist_ = false;
+    static const uint32_t boot_assist_window_ms_ = 5UL * 60UL * 1000UL;
 
     // Dehumidifier assist (set_assist). Persisted with the intent it is holding, because
     // the climate's own restore saves the displayed FAN_ONLY state.
@@ -727,10 +730,10 @@ public:
             remember_intended_();
             if (had_assist) {
                 save_assist_();  // clears the stored flag
-                // The unit is still running the FAN_ONLY we left it in, and the first unit
-                // status after boot is normally adopted as-is -- which would make FAN_ONLY the
-                // intent (Z3, 2026-11-07). Send the restored intent as a change instead, so
-                // incoming frames are ignored until the unit has taken it.
+                // The unit is still running the FAN_ONLY we left it in, and ignores our
+                // commands until its startup exchange; meanwhile its reports would be adopted
+                // as the intent (Z3, Z6 2026-11-07). See process_status_message.
+                boot_from_assist_ = true;
                 user_changed_settings_ = true;
                 operation_mode_changed_ = true;
             }
@@ -1536,6 +1539,29 @@ private:
             unit_defrost_ = buffer[3] & 0x4;
             unit_error_ = buffer[11];
             unit_view_millis_ = millis();
+
+            // Booted from an assist: a FAN_ONLY report is the assist we left running, not a
+            // new intent. Keep sending the intent instead of adopting it, until the unit
+            // reports anything else (it took the intent, or someone changed it) or 5 min pass.
+            if (boot_from_assist_) {
+                if (new_mode != climate::CLIMATE_MODE_FAN_ONLY || millis() > boot_assist_window_ms_ ||
+                    !have_intended_ || intended_mode_ == climate::CLIMATE_MODE_FAN_ONLY) {
+                    boot_from_assist_ = false;
+                } else if (!assist_active_) {
+                    if (!(user_changed_settings_ &&
+                          (pending_status_change_ || pending_send_ == PendingSendKind::Status))) {
+                        ESP_LOGW(TAG, "unit still in the FAN_ONLY of an assist from before the "
+                                 "reboot; resending the intended mode %u", unsigned(intended_mode_));
+                        restore_intended_to_state_();
+                        memcpy(last_recv_status_, buffer, MsgLen);
+                        user_changed_settings_ = true;
+                        pending_status_change_ = true;
+                        operation_mode_changed_ = true;
+                        publish_state();
+                    }
+                    return;
+                }
+            }
         }
 
         uint8_t fan_val = b >> 5;
