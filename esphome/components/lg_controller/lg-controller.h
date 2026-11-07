@@ -283,6 +283,11 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     int8_t overcooling_target_ = -1;
     uint8_t overcooling_write_attempts_ = 0;
 
+    // Installer setting 35 (fan in cooling thermal off: 0 = fan low, 1 = fan off,
+    // 2 = fan setting) to write, or -1 to echo the unit's value. Same give-up rule.
+    int8_t cooling_thermal_off_fan_target_ = -1;
+    uint8_t cooling_thermal_off_fan_write_attempts_ = 0;
+
     // Fan values 5 (low-medium) and 6 (medium-high) have no standard HA fan
     // mode. They are shown as the next lower standard mode, and the raw value
     // is kept here so that our next status message sends it back unchanged
@@ -436,6 +441,9 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
 public:
     void set_overcooling_target(int value) {
         overcooling_target_ = value;
+    }
+    void set_cooling_thermal_off_fan_target(int value) {
+        cooling_thermal_off_fan_target_ = value;
     }
     void set_reassert_after_unit_reset(bool value) { reassert_after_unit_reset_ = value; }
     void set_unit_reset_reasserts_sensor(sensor::Sensor* s) { unit_reset_reasserts_ = s; }
@@ -1207,6 +1215,11 @@ private:
             send_buf_[2] = (send_buf_[2] & 0x3F) | (overcooling_target_ << 6);
         }
 
+        // Byte 9 bits 6-7 store installer setting 35, if we're configured to write it.
+        if (cooling_thermal_off_fan_target_ >= 0) {
+            send_buf_[9] = (send_buf_[9] & 0x3F) | (cooling_thermal_off_fan_target_ << 6);
+        }
+
         send_buf_[12] = calc_checksum(send_buf_);
 
         ESP_LOGD(TAG, "sending %s", format_hex_pretty(send_buf_, MsgLen).c_str());
@@ -1927,7 +1940,8 @@ private:
 
         // Byte 2 bits 6-7 = over cooling (installer setting 27), byte 9 bits 6-7 = fan in
         // cooling thermal off (installer setting 35). Outgoing 0xAB messages start from a copy
-        // of this message, so both are echoed back unchanged unless overcooling_setting is set.
+        // of this message, so both are echoed back unchanged unless overcooling_setting /
+        // cooling_thermal_off_fan_setting is set.
         uint8_t overcooling = (buffer[2] >> 6) & 0b11;
         if (overcooling_ != nullptr) {
             overcooling_->publish_state(overcooling);
@@ -1943,8 +1957,21 @@ private:
                 ESP_LOGE(TAG, "Unit did not accept over cooling %d (still %u)", overcooling_target_, overcooling);
             }
         }
+        uint8_t thermal_off_fan = (buffer[9] >> 6) & 0b11;
         if (cooling_thermal_off_fan_ != nullptr) {
-            cooling_thermal_off_fan_->publish_state((buffer[9] >> 6) & 0b11);
+            cooling_thermal_off_fan_->publish_state(thermal_off_fan);
+        }
+        if (cooling_thermal_off_fan_target_ >= 0 && thermal_off_fan != cooling_thermal_off_fan_target_) {
+            if (cooling_thermal_off_fan_write_attempts_ < 3) {
+                cooling_thermal_off_fan_write_attempts_++;
+                ESP_LOGD(TAG, "Setting cooling thermal-off fan installer setting: %u -> %d (attempt %u)",
+                         thermal_off_fan, cooling_thermal_off_fan_target_, cooling_thermal_off_fan_write_attempts_);
+                pending_type_b_settings_change_ = true;
+            } else if (cooling_thermal_off_fan_write_attempts_ == 3) {
+                cooling_thermal_off_fan_write_attempts_++;
+                ESP_LOGE(TAG, "Unit did not accept cooling thermal-off fan %d (still %u)",
+                         cooling_thermal_off_fan_target_, thermal_off_fan);
+            }
         }
         // Byte 6 bit 2 = centigrade control (installer setting 17): 0 = 1 °C, 1 = 0.5 °C.
         if (temperature_control_step_ != nullptr) {
