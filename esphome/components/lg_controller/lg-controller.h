@@ -304,6 +304,18 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     int8_t external_ventilation_ = -1;
     bool ignore_callbacks_ = false;
 
+    // Dehumidifier assist (set_assist). Persisted with the intent it is holding, because
+    // the climate's own restore saves the displayed FAN_ONLY state.
+    bool assist_active_ = false;
+    struct AssistStore {
+        uint8_t active;
+        uint8_t mode;
+        uint8_t has_fan;
+        uint8_t fan;
+        float target;
+    };
+    ESPPreferenceObject assist_pref_;
+
     uint32_t NVS_STORAGE_VERSION = 2843654U; // Change version if the NVSStorage struct changes
     struct NVSStorage {
         uint8_t capabilities_message[13] = {};
@@ -450,6 +462,52 @@ public:
         external_ventilation_ = on ? 1 : 0;
         user_changed_settings_ = true;
         pending_status_change_ = true;
+    }
+    // Dehumidifier assist. While on, the unit runs FAN_ONLY at LOW so a duct dehumidifier
+    // has airflow at thermal-off, but the commanded state the board holds (the "intent":
+    // what HA, the wall controller or the unit last set) is kept. Turning it off restores
+    // the intent. The caller (the zone package) decides when; the component keeps the
+    // intent straight:
+    //   - an HA mode or fan command, or a mode/power change from the wall or the unit,
+    //     ends the assist and becomes the new intent (remember_intended_ ends it);
+    //   - an HA or wall setpoint change during the assist updates only the intended
+    //     setpoint, and the assist stays on;
+    //   - a unit-reset reassert or startup re-send restores the intent and ends it;
+    //   - it persists across a reboot, so the board comes back with the intent, not
+    //     FAN_ONLY.
+    void set_assist(bool on) {
+        if (on == assist_active_) {
+            return;
+        }
+        if (on) {
+            if (!have_intended_) {
+                remember_intended_();
+            }
+            assist_active_ = true;
+            this->mode = climate::CLIMATE_MODE_FAN_ONLY;
+            this->fan_mode = climate::CLIMATE_FAN_LOW;
+            this->target_temperature = intended_target_;
+            this->action = climate::CLIMATE_ACTION_FAN;
+            ESP_LOGI(TAG, "Dehumidifier assist on: FAN_ONLY / LOW (holding intent mode %u)",
+                     unsigned(intended_mode_));
+        } else {
+            assist_active_ = false;
+            restore_intended_to_state_();
+            ESP_LOGI(TAG, "Dehumidifier assist off: restoring mode %u", unsigned(this->mode));
+        }
+        save_assist_();
+        unit_fan_raw_ = 0xFF;
+        operation_mode_changed_ = true;
+        user_changed_settings_ = true;
+        pending_status_change_ = true;
+        this->publish_state();
+    }
+    bool is_assist_active() const { return assist_active_; }
+    climate::ClimateMode get_intended_mode() const {
+        return have_intended_ ? intended_mode_ : this->mode;
+    }
+    float get_intended_target() const {
+        return have_intended_ ? intended_target_ : this->target_temperature;
     }
     void set_overcooling_target(int value) {
         overcooling_target_ = value;
@@ -616,12 +674,31 @@ public:
         ESPPreferenceObject pref = global_preferences->make_preference<NVSStorage>(this->get_object_id_hash() ^ NVS_STORAGE_VERSION);
         pref.load(&nvs_storage_);
 
+        assist_pref_ = global_preferences->make_preference<AssistStore>(
+            this->get_object_id_hash() ^ 0x41535354U);  // "ASST"
+        AssistStore assist{};
+        bool had_assist = assist_pref_.load(&assist) && assist.active;
+
         auto restore = this->restore_state_();
         if (restore.has_value()) {
             restore->apply(this);
+            if (had_assist) {
+                // Rebooted mid-assist: the restored state is the FAN_ONLY we displayed.
+                // Come back with the intent; the package re-enters the assist if needed.
+                this->mode = static_cast<climate::ClimateMode>(assist.mode);
+                this->target_temperature = assist.target;
+                if (assist.has_fan) {
+                    this->fan_mode = static_cast<climate::ClimateFanMode>(assist.fan);
+                }
+                ESP_LOGW(TAG, "rebooted during dehumidifier assist; restoring mode %u",
+                         unsigned(assist.mode));
+            }
             this->target_temperature = get_roundtrip_target_temperature
                 (this->target_temperature);
             remember_intended_();
+            if (had_assist) {
+                save_assist_();  // clears the stored flag
+            }
         } else {
             this->mode = climate::CLIMATE_MODE_OFF;
             this->target_temperature = 20;
@@ -665,6 +742,28 @@ public:
 
     // Process changes from HA.
     void control(const climate::ClimateCall &call) override {
+        if (assist_active_) {
+            if (!call.get_mode().has_value() && !call.get_fan_mode().has_value()) {
+                // Setpoint (or swing) only: a new intended setpoint; the assist stays on.
+                if (call.get_target_temperature().has_value()) {
+                    intended_target_ = get_roundtrip_target_temperature
+                        (*call.get_target_temperature());
+                    this->target_temperature = intended_target_;
+                    save_assist_();
+                }
+                if (call.get_swing_mode().has_value()) {
+                    set_swing_mode(*call.get_swing_mode());
+                }
+                this->user_changed_settings_ = true;
+                this->pending_status_change_ = true;
+                this->publish_state();
+                return;
+            }
+            // A mode or fan command ends the assist: apply it to the intent, not to the
+            // FAN_ONLY / LOW we are displaying (remember_intended_ below clears the flag).
+            ESP_LOGI(TAG, "HA command during dehumidifier assist: ending it");
+            restore_intended_to_state_();
+        }
         if (call.get_mode().has_value()) {
             this->mode = *call.get_mode();
             operation_mode_changed_ = true;
@@ -1563,7 +1662,21 @@ private:
                 ignore_callbacks_ = false;
                 active_reservation_ = buffer[3] & 0x10;
                 // A change the unit made that we accepted is now the state to hold.
-                remember_intended_();
+                // During the dehumidifier assist only a mode/power change does that (and
+                // ends the assist); a setpoint change is the new intended setpoint, and a
+                // fan change at the wall just changes the assist's fan.
+                if (assist_active_ && !mode_changed) {
+                    if (set_temperature_changed) {
+                        intended_target_ = target;
+                        save_assist_();
+                    }
+                } else {
+                    if (assist_active_) {
+                        ESP_LOGI(TAG, "%s changed the mode during dehumidifier assist: "
+                                 "ending it", sender == MessageSender::Slave ? "wall" : "unit");
+                    }
+                    remember_intended_();
+                }
                 if (sender == MessageSender::Unit && !waiting_for_first_status) {
                     note_unit_change_("adopted", buffer);
                 }
@@ -1739,11 +1852,53 @@ private:
         }
     }
 
+    // The current state becomes the state to hold. That replaces whatever the dehumidifier
+    // assist was holding, so it also ends the assist.
     void remember_intended_() {
         intended_mode_ = this->mode;
         intended_target_ = this->target_temperature;
         intended_fan_mode_ = this->fan_mode;
         have_intended_ = true;
+        if (assist_active_) {
+            assist_active_ = false;
+            save_assist_();
+        }
+    }
+
+    void restore_intended_to_state_() {
+        if (!have_intended_) {
+            return;
+        }
+        this->mode = intended_mode_;
+        this->target_temperature = intended_target_;
+        this->fan_mode = intended_fan_mode_;
+        unit_fan_raw_ = 0xFF;
+        if (this->mode == climate::CLIMATE_MODE_OFF) {
+            this->action = climate::CLIMATE_ACTION_OFF;
+        } else if (this->mode == climate::CLIMATE_MODE_FAN_ONLY) {
+            this->action = climate::CLIMATE_ACTION_FAN;
+        } else {
+            this->action = climate::CLIMATE_ACTION_IDLE;
+        }
+    }
+
+    // Ends the assist without a send of its own: the caller is about to resend the intent.
+    void drop_assist_for_resend_() {
+        if (assist_active_) {
+            ESP_LOGI(TAG, "dehumidifier assist ended by a resend of the commanded state");
+            assist_active_ = false;
+            save_assist_();
+        }
+    }
+
+    void save_assist_() {
+        AssistStore s{};
+        s.active = assist_active_ ? 1 : 0;
+        s.mode = uint8_t(intended_mode_);
+        s.has_fan = intended_fan_mode_.has_value() ? 1 : 0;
+        s.fan = intended_fan_mode_.has_value() ? uint8_t(*intended_fan_mode_) : 0;
+        s.target = intended_target_;
+        assist_pref_.save(&s);
     }
 
     // OFF (byte 1 power bit clear) at exactly 18.0 °C (byte 6 low nibble 3, byte 5 half-degree
@@ -1792,6 +1947,7 @@ private:
             last_reassert_millis_ = now;
         }
 
+        drop_assist_for_resend_();
         this->mode = intended_mode_;
         this->target_temperature = intended_target_;
         this->fan_mode = intended_fan_mode_;
@@ -1846,6 +2002,7 @@ private:
             reinit_requested_ = false;
             set_timeout("reinit_send", reinit_send_delay_ms_, [this]() {
                 if (have_intended_) {
+                    drop_assist_for_resend_();
                     this->mode = intended_mode_;
                     this->target_temperature = intended_target_;
                     this->fan_mode = intended_fan_mode_;
