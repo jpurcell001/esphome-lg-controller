@@ -454,8 +454,11 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
                 override_fan_modes.insert(climate::CLIMATE_FAN_FOCUS);
             supported_traits_.set_supported_fan_modes(override_fan_modes);
 
+            // A unit with no vanes (our ducted units) advertises no swing at all, so HA
+            // shows no swing control or attribute. Empty mask = no swing support.
             climate::ClimateSwingModeMask override_swing_modes;
-            override_swing_modes.insert(climate::CLIMATE_SWING_OFF);
+            if (unit_has_swing_())
+                override_swing_modes.insert(climate::CLIMATE_SWING_OFF);
             if (parse_capability(LgCapability::VERTICAL_SWING) && parse_capability(LgCapability::HORIZONTAL_SWING))
                 override_swing_modes.insert(climate::CLIMATE_SWING_BOTH);
             if (parse_capability(LgCapability::VERTICAL_SWING))
@@ -463,7 +466,17 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
             if (parse_capability(LgCapability::HORIZONTAL_SWING))
                 override_swing_modes.insert(climate::CLIMATE_SWING_HORIZONTAL);
             supported_traits_.set_supported_swing_modes(override_swing_modes);
+            if (!unit_has_swing_())
+                this->swing_mode = climate::CLIMATE_SWING_OFF;
         }
+    }
+
+    // True unless the capabilities are known and the unit reports neither swing axis.
+    bool unit_has_swing_() {
+        if (nvs_storage_.capabilities_message[0] == 0)
+            return true;
+        return parse_capability(LgCapability::VERTICAL_SWING) ||
+               parse_capability(LgCapability::HORIZONTAL_SWING);
     }
 
 public:
@@ -1598,6 +1611,13 @@ private:
 
         bool horiz_swing = buffer[2] & 0x40;
         bool vert_swing = buffer[2] & 0x80;
+        // Drop swing bits for an axis the unit doesn't have. A wall controller (PREMTB101)
+        // sets vertical swing on our vaneless ducted units and the unit clears it; without
+        // this the bit was adopted, published to HA and logged as an unexpected change.
+        if (nvs_storage_.capabilities_message[0] != 0) {
+            horiz_swing = horiz_swing && parse_capability(LgCapability::HORIZONTAL_SWING);
+            vert_swing = vert_swing && parse_capability(LgCapability::VERTICAL_SWING);
+        }
         climate::ClimateSwingMode new_swing_mode;
         if (horiz_swing && vert_swing) {
             new_swing_mode = climate::CLIMATE_SWING_BOTH;
