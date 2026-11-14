@@ -40,6 +40,7 @@ CONF_FAHRENHEIT = "fahrenheit"
 CONF_IS_SLAVE_CONTROLLER = "is_slave_controller"
 CONF_OVERCOOLING_SETTING = "overcooling_setting"
 CONF_COOLING_THERMAL_OFF_FAN_SETTING = "cooling_thermal_off_fan_setting"
+CONF_CONTINUOUS_FAN_SETTING = "continuous_fan_setting"
 CONF_REASSERT_AFTER_UNIT_RESET = "reassert_after_unit_reset"
 CONF_UNIT_RESET_REASSERTS = "unit_reset_reasserts"
 CONF_UNIT_RESTARTS = "unit_restarts"
@@ -105,6 +106,8 @@ CONFIG_SCHEMA = climate.climate_schema(LgController).extend(
         cv.Optional(CONF_OVERCOOLING_SETTING, default=-1): cv.int_range(min=-1, max=3),
         # Installer setting 35: 0 = fan low, 1 = fan off, 2 = fan setting; -1 = leave as is.
         cv.Optional(CONF_COOLING_THERMAL_OFF_FAN_SETTING, default=-1): cv.int_range(min=-1, max=2),
+        # Installer setting 46 (continuous fan): 0 = off, 1 = on; -1 = leave as is.
+        cv.Optional(CONF_CONTINUOUS_FAN_SETTING, default=-1): cv.int_range(min=-1, max=1),
         # When the unit drops by itself to its reset default (OFF / 18 °C with the changed
         # bit set -- what it reports going into and coming out of a power interruption),
         # resend the board's last commanded state instead of adopting the reset, then re-run
@@ -317,6 +320,7 @@ async def to_code(config):
                            config[CONF_FAHRENHEIT], config[CONF_IS_SLAVE_CONTROLLER])
     cg.add(var.set_overcooling_target(config[CONF_OVERCOOLING_SETTING]))
     cg.add(var.set_cooling_thermal_off_fan_target(config[CONF_COOLING_THERMAL_OFF_FAN_SETTING]))
+    cg.add(var.set_continuous_fan_target(config[CONF_CONTINUOUS_FAN_SETTING]))
     cg.add(var.set_reassert_after_unit_reset(config[CONF_REASSERT_AFTER_UNIT_RESET]))
     for key in (CONF_TEMPERATURE_CONTROL_STEP, CONF_STATIC_PRESSURE_STEP,
                 CONF_CONTINUOUS_FAN, CONF_TEMPERATURE_BASED_FAN_AUTO,

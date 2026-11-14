@@ -214,13 +214,14 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     uint32_t last_write_millis_ = 0;
     uint32_t last_line_busy_millis_ = 0;
 
-    enum class PendingSendKind : uint8_t { None, Status, TypeA, TypeB };
+    enum class PendingSendKind : uint8_t { None, Status, TypeA, TypeB, TypeE };
     PendingSendKind pending_send_ = PendingSendKind::None;
 
     bool pending_status_change_ = false;
     bool pending_type_a_settings_change_ = false;
     bool pending_type_b_settings_change_ = false;
     bool pending_type_b_timed_message_ = false;
+    bool pending_type_e_settings_change_ = false;
     bool operation_mode_changed_ = false;
     bool user_changed_settings_ = false;
 
@@ -287,6 +288,13 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     // 2 = fan setting) to write, or -1 to echo the unit's value. Same give-up rule.
     int8_t cooling_thermal_off_fan_target_ = -1;
     uint8_t cooling_thermal_off_fan_write_attempts_ = 0;
+
+    // Installer setting 46 (continuous fan: 0 = off, 1 = on) to write, or -1 to leave the
+    // unit alone. It lives in the 0xCE.10 frame, which the unit sends only in its settings
+    // dump, so a write goes out as an 0xAE.10 copy of that frame with one bit changed
+    // and is confirmed by the next dump. Same give-up rule.
+    int8_t continuous_fan_target_ = -1;
+    uint8_t continuous_fan_write_attempts_ = 0;
 
     // Fan values 5 (low-medium) and 6 (medium-high) have no standard HA fan
     // mode. They are shown as the next lower standard mode, and the raw value
@@ -559,6 +567,9 @@ public:
     }
     void set_cooling_thermal_off_fan_target(int value) {
         cooling_thermal_off_fan_target_ = value;
+    }
+    void set_continuous_fan_target(int value) {
+        continuous_fan_target_ = value;
     }
     void set_reassert_after_unit_reset(bool value) { reassert_after_unit_reset_ = value; }
     void set_unit_reset_reasserts_sensor(sensor::Sensor* s) { unit_reset_reasserts_ = s; }
@@ -905,6 +916,9 @@ public:
                 case PendingSendKind::TypeB:
                     pending_type_b_settings_change_ = true;
                     break;
+                case PendingSendKind::TypeE:
+                    pending_type_e_settings_change_ = true;
+                    break;
                 case PendingSendKind::None:
                     ESP_LOGE(TAG, "unreachable");
                     break;
@@ -922,6 +936,8 @@ public:
                 send_type_a_settings_message();
             } else if (pending_type_b_settings_change_) {
                 send_type_b_settings_message(/* timed = */ false);
+            } else if (pending_type_e_settings_change_) {
+                send_type_e_settings_message();
             } else if (pending_type_b_timed_message_) {
                 send_type_b_settings_message(/* timed = */ true);
                 pending_type_b_timed_message_ = false;
@@ -1349,6 +1365,27 @@ private:
 
         pending_type_a_settings_change_ = false;
         pending_send_ = PendingSendKind::TypeA;
+    }
+
+    // 0xAE.10: a copy of the unit's last 0xCE.10 with byte 4 bit 1 (installer setting 46,
+    // continuous fan) set to the target. Everything else (setting 51 in bit 2, silent mode,
+    // defrost, cycle priority...) is echoed unchanged. Format per protocol.md, Type 6.
+    void send_type_e_settings_message() {
+        pending_type_e_settings_change_ = false;
+        const uint8_t* last = last_recv_type_e_settings_[1];
+        if (last[0] != 0xCE || last[1] != 0x10 || continuous_fan_target_ < 0) {
+            ESP_LOGE(TAG, "No 0xCE.10 frame to base an 0xAE.10 write on");
+            return;
+        }
+        memcpy(send_buf_, last, MsgLen);
+        send_buf_[0] = slave_ ? 0x2E : 0xAE;
+        send_buf_[4] = (send_buf_[4] & ~0x02) | (continuous_fan_target_ << 1);
+        send_buf_[12] = calc_checksum(send_buf_);
+
+        ESP_LOGI(TAG, "sending %s", format_hex_pretty(send_buf_, MsgLen).c_str());
+        UARTDevice::write_array(send_buf_, MsgLen);
+        last_write_millis_ = millis();
+        pending_send_ = PendingSendKind::TypeE;
     }
 
     void send_type_b_settings_message(bool timed) {
@@ -2378,8 +2415,21 @@ private:
         // 0xCE.10 byte 4: bit 1 = continuous fan (installer setting 46), bit 2 =
         // temperature-based fan speed auto (51).
         if (buffer[1] == 0x10) {
+            uint8_t continuous_fan = (buffer[4] >> 1) & 0b1;
             if (continuous_fan_ != nullptr) {
-                continuous_fan_->publish_state((buffer[4] >> 1) & 0b1);
+                continuous_fan_->publish_state(continuous_fan);
+            }
+            if (continuous_fan_target_ >= 0 && continuous_fan != continuous_fan_target_) {
+                if (continuous_fan_write_attempts_ < 3) {
+                    continuous_fan_write_attempts_++;
+                    ESP_LOGI(TAG, "Setting continuous fan installer setting: %u -> %d (attempt %u)",
+                             continuous_fan, continuous_fan_target_, continuous_fan_write_attempts_);
+                    pending_type_e_settings_change_ = true;
+                } else if (continuous_fan_write_attempts_ == 3) {
+                    continuous_fan_write_attempts_++;
+                    ESP_LOGE(TAG, "Unit did not accept continuous fan %d (still %u)",
+                             continuous_fan_target_, continuous_fan);
+                }
             }
             if (temperature_based_fan_auto_ != nullptr) {
                 temperature_based_fan_auto_->publish_state((buffer[4] >> 2) & 0b1);
